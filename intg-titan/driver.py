@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -196,13 +197,24 @@ class Driver:
         except OSError:
             pass
 
+    @staticmethod
+    def tls_context() -> ssl.SSLContext:
+        """Certificates of certifi: the Python packed for the Remote has no system certificate store."""
+        try:
+            import certifi
+
+            return ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            return ssl.create_default_context()
+
     def download_guide(self) -> None:
         """Public guide written to the config directory as it comes (~9 MB gzipped)."""
         for url in epg.SOURCES:
             tmp = self.path("epg.xml.gz.part")
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "uc-intg-iptv-kodi"})
-                with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+                with urllib.request.urlopen(req, timeout=120, context=self.tls_context()) as resp, \
+                        open(tmp, "wb") as out:
                     shutil.copyfileobj(resp, out, 65536)
                 os.replace(tmp, self.path("epg.xml.gz"))
                 return

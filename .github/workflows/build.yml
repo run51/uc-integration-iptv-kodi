@@ -42,7 +42,7 @@ jobs:
             docker.io/unfoldedcircle/r2-pyinstaller:${PYTHON_VER} \
             bash -c "cd /workspace && \
               python -m pip install -r requirements.txt && \
-              pyinstaller --clean --onedir --collect-all tzdata \
+              pyinstaller --clean --onedir --collect-all tzdata --collect-data certifi \
                 --name intg-${DRIVER_ID} intg-titan/driver.py"
 
       - name: Package
