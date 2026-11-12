@@ -37,6 +37,8 @@ POLL_S = 5
 EPG_REFRESH_S = 6 * 3600
 EPG_RETRY_S = 15 * 60
 KODI_STORE = "https://play.google.com/store/apps/details?id=org.xbmc.kodi"
+KODI_APP, STORE_APP = "org.xbmc.kodi", "com.android.vending"
+ANDROID_LOG = "intg-androidtv"  # log service of the Remote's Android TV integration
 REPLAY_CHECK_S = 12  # after starting a replay, time to see whether the provider sent the programme or live TV
 OFF_STATES = ("OFF", "STANDBY", "UNAVAILABLE")
 
@@ -98,6 +100,21 @@ class RemoteApi:
     async def command(self, entity_id: str, cmd_id: str, params: dict | None = None) -> None:
         body = {"cmd_id": cmd_id, **({"params": params} if params else {})}
         await asyncio.to_thread(self._call, "PUT", f"/api/entities/{entity_id}/command", body)
+
+    async def current_app(self, service: str = ANDROID_LOG) -> tuple[str, str] | None:
+        """(time, package) of the app on screen, as the Android TV integration last logged it
+        ("current_app: org.xbmc.kodi"); its media player entity does not tell (its source stays the Play
+        Store after Kodi was opened from there). None when the log is not readable."""
+        try:
+            lines = await asyncio.to_thread(
+                self._call, "GET", f"/api/system/logs?s={service}&p=7&limit=5&q=current_app")
+        except (OSError, ValueError, urllib.error.URLError):
+            return None
+        for line in lines or []:
+            msg = str(line.get("msg") or "")
+            if "current_app:" in msg:
+                return str(line.get("ts") or ""), msg.split("current_app:")[-1].strip()
+        return None
 
 
 def page_bounds(paging) -> tuple[int, int]:
@@ -285,8 +302,9 @@ class Driver:
 
     # -------------------------------------------------------------- browsing
     async def browse(self, options: mp.BrowseOptions):
+        playing = self.last.get(mp.Attributes.STATE) in (mp.States.PLAYING, mp.States.PAUSED)
         try:
-            container, items = self.catalog.browse(options.media_id)
+            container, items = self.catalog.browse(options.media_id, self.current if playing else None)
         except KeyError:
             return ucapi.StatusCodes.NOT_FOUND
         page, limit = page_bounds(options.paging)
@@ -303,20 +321,48 @@ class Driver:
     async def shield_state(self) -> dict:
         return (await self.remote.entity(self.shield)).get("attributes") or {}
 
+    async def app_after(self, since: str, package: str, seconds: float) -> bool:
+        """Wait until the Android TV integration logs this app on screen after the time given."""
+        for _ in range(int(seconds * 2)):
+            app = await self.remote.current_app()
+            if app and app[0] > since and app[1] == package:
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
     async def bring_kodi(self) -> None:
-        """Play Store page of Kodi, then "Ouvrir" (focused). The page may take 8 s to show after a wake-up:
-        press again while Kodi does not answer (an extra press on the page or on Kodi's splash is harmless)."""
+        """Play Store page of Kodi, then "Ouvrir" (focused) once the page is on screen (it may take 8 s after a
+        wake-up), again while Kodi is not on screen. Without the integration's log: fixed waits."""
         _LOG.info("Opening Kodi (Play Store page, then Ouvrir)")
+        before = await self.remote.current_app()
+        since = before[0] if before else ""
         await self.remote.command(self.shield, "media_player.select_source", {"source": KODI_STORE})
-        await asyncio.sleep(7)
+        if before:
+            if not await self.app_after(since, STORE_APP, 15):
+                _LOG.warning("The Play Store page did not show")
+        else:
+            await asyncio.sleep(7)
         for _ in range(3):
+            app = await self.remote.current_app()
+            pressed_at = app[0] if app else ""
             await self.remote.command(self.shield, "media_player.cursor_enter")
-            for _ in range(10):
-                await asyncio.sleep(1)
-                if await self.kodi.alive():
-                    self.kodi_front = True
-                    return
-        _LOG.warning("Kodi did not open from its Play Store page")
+            if before:
+                if await self.app_after(pressed_at, KODI_APP, 8):
+                    break
+            else:
+                for _ in range(10):
+                    await asyncio.sleep(1)
+                    if await self.kodi.alive():
+                        break
+                break
+        else:
+            _LOG.warning("Kodi did not open from its Play Store page")
+            return
+        self.kodi_front = True
+
+    async def kodi_on_screen(self) -> bool:
+        app = await self.remote.current_app()
+        return app[1] == KODI_APP if app else self.kodi_front
 
     def watch_shield(self, a: dict) -> None:
         """Forget that Kodi is on screen once the Shield sleeps, dreams or shows another app.
@@ -330,10 +376,11 @@ class Driver:
         async with self.launch_lock:
             a = await self.shield_state()
             self.watch_shield(a)
-            if a.get("state") in OFF_STATES:  # it wakes up on the home screen
+            woke = a.get("state") in OFF_STATES
+            if woke:  # it wakes up on the home screen
                 await self.remote.command(self.shield, "media_player.on")
                 await asyncio.sleep(8)
-            if to_front or not self.kodi_front or not await self.kodi.alive():
+            if to_front or woke or not await self.kodi_on_screen() or not await self.kodi.alive():
                 await self.bring_kodi()
             for _ in range(30):
                 if await self.kodi.alive() and await self.kodi.pvr_ready():

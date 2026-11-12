@@ -5,6 +5,7 @@ catalog.json (built by tools/build_catalog.py from the provider's M3U playlist):
   "logo": "https://..."}]}]}
 
 Media ids:
+  "" (browser opened) while a channel plays: its programme page, with a first row to all the channels
   root               the categories, in the provider's order (as in Titan Player)
   cat:<cat>          a category: first the "Programme TV" row, then its channels (tap = play at once)
   guide:<cat>        the same channels, tap = the channel's programme page (the remote has no long press)
@@ -219,9 +220,12 @@ class Catalog:
             thumbnail=ch.get("logo") or CHANNEL_ICON,
         )
 
-    def programme_items(self, cat: dict, ch: dict) -> list[BrowseMediaItem]:
+    def programme_items(self, cat: dict, ch: dict, name_on_air: bool = False) -> list[BrowseMediaItem]:
+        """Programme rows of a channel; name_on_air: the row on air names the channel (the browser opened
+        from the player shows no page header)."""
         items = []
         now = time.time()
+        short = re.sub(r"\s*\(.*?\)", "", ch["name"]).strip()
         if self.has_replay(ch["id"]):
             items.append(BrowseMediaItem(
                 media_id=f"past:{cat['id']}:{ch['id']}",
@@ -235,10 +239,11 @@ class Catalog:
         for p in self.guide.upcoming(ch["id"]) if self.guide else []:
             when = f"{day_label(p['start'], now)}{hhmm(p['start'])}–{hhmm(p['stop'])}"
             on_air = p["start"] <= now < p["stop"]
+            label = (f"En cours sur {short} · " if name_on_air else "En cours · ") if on_air else ""
             items.append(BrowseMediaItem(
                 media_id=f"ch:{cat['id']}:{ch['id']}",  # playing a programme row plays the channel
                 title=p["title"] + (f" – {p['sub']}" if p.get("sub") else ""),
-                subtitle=("En cours · " if on_air else "") + when + (f" · {p['cat']}" if p.get("cat") else ""),
+                subtitle=label + when + (f" · {p['cat']}" if p.get("cat") else ""),
                 media_class=MediaClass.VIDEO,
                 media_type=MediaContentType.VIDEO,
                 can_play=on_air,
@@ -271,8 +276,34 @@ class Catalog:
             thumbnail=CATEGORY_ICON,
         )
 
-    def browse(self, media_id: str | None) -> tuple[BrowseMediaItem, list[BrowseMediaItem]]:
-        """Container and its children; KeyError for an unknown id."""
+    def programme_page(self, cat: dict, ch: dict, media_id: str) -> BrowseMediaItem:
+        p = self.guide.now(ch["id"]) if self.guide else None
+        return BrowseMediaItem(  # programme page: cover = logo, info line = programme on air, Play = watch
+            media_id=media_id,
+            title=ch["name"],
+            artist=f"En cours : {p['title']}" if p else cat["name"],
+            media_class=MediaClass.PLAYLIST,  # the remote shows a playlist as a page: cover, info line, Play
+            media_type=MediaContentType.CHANNEL,
+            can_browse=True,
+            can_play=True,
+            thumbnail=ch.get("logo") or CHANNEL_ICON,
+        )
+
+    def browse(self, media_id: str | None, current: tuple[str, int] | None = None
+               ) -> tuple[BrowseMediaItem, list[BrowseMediaItem]]:
+        """Container and its children; KeyError for an unknown id.
+
+        current = (category, stream) of the channel playing: the browser opened from the player (long press
+        on the picture, or its browse icon) then starts on that channel's programme page."""
+        if not media_id and current and self.channel(*current):
+            cat, ch = self.by_id[current[0]], self.channel(*current)
+            container = self.programme_page(cat, ch, f"ch:{cat['id']}:{ch['id']}")
+            home = BrowseMediaItem(
+                media_id=ROOT, title="Toutes les chaînes", subtitle="Catégories, programme TV, recherche",
+                media_class=MediaClass.DIRECTORY, media_type=MediaContentType.CHANNELS, can_browse=True,
+                thumbnail=CATEGORY_ICON,
+            )
+            return container, [home, *self.programme_items(cat, ch, name_on_air=True)]
         media_id = media_id or ROOT
         if media_id == ROOT:
             container = BrowseMediaItem(
@@ -309,18 +340,7 @@ class Catalog:
         parsed = self.parse_channel_id(media_id)
         if parsed and self.channel(*parsed):
             cat, ch = self.by_id[parsed[0]], self.channel(*parsed)
-            p = self.guide.now(ch["id"]) if self.guide else None
-            container = BrowseMediaItem(  # programme page: cover = logo, info line = programme on air, Play = watch
-                media_id=media_id,
-                title=ch["name"],
-                artist=f"En cours : {p['title']}" if p else cat["name"],
-                media_class=MediaClass.PLAYLIST,  # the remote shows a playlist as a page: cover, info line, Play
-                media_type=MediaContentType.CHANNEL,
-                can_browse=True,
-                can_play=True,
-                thumbnail=ch.get("logo") or CHANNEL_ICON,
-            )
-            return container, self.programme_items(cat, ch)
+            return self.programme_page(cat, ch, media_id), self.programme_items(cat, ch)
         raise KeyError(media_id)
 
     def search(self, query: str, limit: int = 200) -> list[BrowseMediaItem]:
