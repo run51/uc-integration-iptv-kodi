@@ -318,9 +318,9 @@ class Driver:
         """Logos of the channels shown (and kept for the replay) downloaded into the image cache, gently."""
         if self.images:
             urls = [ch.get("logo") for _, ch in self.catalog.lineup if ch.get("logo")]
-            done = await asyncio.to_thread(self.images.prefetch, urls)
-            if done:
-                _LOG.info("Image cache: %d channel logos downloaded", done)
+            queued = self.images.prefetch(urls)  # downloaded one by one by the cache's background worker
+            if queued:
+                _LOG.info("Image cache: %d channel logos queued", queued)
 
     async def guide_loop(self) -> None:
         await self.load_guide(download=False)  # copy kept first: the channel ids at once

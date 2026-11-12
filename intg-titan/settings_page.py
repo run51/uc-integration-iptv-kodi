@@ -132,8 +132,12 @@ def start(port: int, get_catalog, get_hidden, save_hidden, import_m3u=None, feed
             path = self.path.split("?")[0]
             if path.startswith("/img/") and image:  # picture through the image cache (?u=original address)
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-                found = image(query.get("u", [""])[0])
-                if found is None:
+                original = query.get("u", [""])[0]
+                found = image(original)
+                if found is None and original.startswith(("http://", "https://")):
+                    # not cached yet (queued): the interface gets it from its original address, at once
+                    self._send(302, b"", "text/plain", {"Location": original, "Cache-Control": "no-store"})
+                elif found is None:
                     self._send(404, b"not found", "text/plain")
                 else:
                     self._send(200, found[0], found[1], {"Cache-Control": "max-age=31536000, immutable"})
