@@ -15,6 +15,7 @@ import os
 import urllib.error
 import urllib.request
 
+import settings_page
 import ucapi
 from catalog import Catalog
 from ucapi import media_player as mp
@@ -110,6 +111,17 @@ class Driver:
         self.current: tuple[str, int] | None = None  # (category id, stream id) last played
         self.last: dict = {}
         self.poll_task: asyncio.Task | None = None
+        self.raw_catalog: dict = {}
+        self.hidden: dict = {}
+        self.settings_server = None
+
+    def save_hidden(self, hidden: dict) -> None:
+        """Called from the settings page thread: store the hidden lists and rebuild the browsed catalog."""
+        with open(self.path("hidden.json"), "w", encoding="utf-8") as file:
+            json.dump(hidden, file)
+        self.hidden = hidden
+        self.catalog = Catalog(self.raw_catalog, hidden)
+        _LOG.info("Hidden: %d categories, %d channel lists", len(hidden["categories"]), len(hidden["channels"]))
 
     # ------------------------------------------------------------- configuration
     def path(self, name: str) -> str:
@@ -128,7 +140,16 @@ class Driver:
         self.remote = RemoteApi(cfg["remote_url"], cfg["api_key"])
         self.shield = cfg.get("shield") or DEFAULT_SHIELD
         self.account = int(cfg.get("account") or 1)
-        self.catalog = Catalog(self.load_json("catalog.json") or {})
+        self.raw_catalog = self.load_json("catalog.json") or {}
+        self.hidden = self.load_json("hidden.json") or {}
+        self.catalog = Catalog(self.raw_catalog, self.hidden)
+        if self.settings_server is None:
+            port = int(os.getenv("TITAN_SETTINGS_PORT", "9097"))
+            try:
+                self.settings_server = settings_page.start(
+                    port, lambda: self.raw_catalog, lambda: self.hidden, self.save_hidden)
+            except OSError as ex:
+                _LOG.warning("Settings page not started on port %d: %s", port, ex)
         state = self.load_json("state.json") or {}
         if state.get("category") and state.get("stream"):
             self.current = (str(state["category"]), int(state["stream"]))

@@ -25,9 +25,26 @@ def fold(text: str) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
+def apply_filter(data: dict, hidden: dict | None) -> dict:
+    """Catalog without the categories and channels hidden on the settings page.
+
+    hidden = {"categories": ["7", ...], "channels": {"3": [1151, ...]}}
+    """
+    hidden = hidden or {}
+    cats = set(hidden.get("categories") or [])
+    chans = {k: set(v) for k, v in (hidden.get("channels") or {}).items()}
+    out = []
+    for cat in data.get("categories", []):
+        if cat["id"] in cats:
+            continue
+        drop = chans.get(cat["id"], set())
+        out.append({**cat, "channels": [ch for ch in cat["channels"] if ch["id"] not in drop]})
+    return {"categories": out}
+
+
 class Catalog:
-    def __init__(self, data: dict):
-        self.categories = [c for c in data.get("categories", []) if c.get("channels")]
+    def __init__(self, data: dict, hidden: dict | None = None):
+        self.categories = [c for c in apply_filter(data, hidden)["categories"] if c.get("channels")]
         self.by_id = {c["id"]: c for c in self.categories}
 
     def channel(self, cat_id: str, stream_id: int) -> dict | None:
