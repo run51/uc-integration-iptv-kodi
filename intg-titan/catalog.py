@@ -170,7 +170,7 @@ class Catalog:
                 media_id=media_id,
                 title=ch["name"],
                 artist=f"En cours : {p['title']}" if p else cat["name"],
-                media_class=MediaClass.CHANNEL,
+                media_class=MediaClass.PLAYLIST,  # the remote shows a playlist as a page: cover, info line, Play
                 media_type=MediaContentType.CHANNEL,
                 can_browse=True,
                 can_play=True,

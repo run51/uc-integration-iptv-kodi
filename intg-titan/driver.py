@@ -319,7 +319,7 @@ class Driver:
                 p = self.guide.now(ch["id"]) if self.guide else None
                 if p:  # "Plus belle la vie" / "TF1 FHD · 14:00–14:25" with the programme image and its progress
                     attrs[mp.Attributes.MEDIA_TITLE] = p["title"]
-                    attrs[mp.Attributes.MEDIA_ARTIST] = f"{ch['name']} · {hhmm(p['start'])}–{hhmm(p['stop'])}"
+                    attrs[mp.Attributes.MEDIA_ARTIST] = f"{hhmm(p['start'])}–{hhmm(p['stop'])} · {ch['name']}"
                     attrs[mp.Attributes.MEDIA_IMAGE_URL] = p.get("icon") or attrs[mp.Attributes.MEDIA_IMAGE_URL]
                     attrs[mp.Attributes.MEDIA_DURATION] = p["stop"] - p["start"]
                     key = (ch["id"], p["start"])
