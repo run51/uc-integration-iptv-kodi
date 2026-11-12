@@ -140,6 +140,9 @@ class Driver:
         self.check_task: asyncio.Task | None = None
         self.launch_lock = asyncio.Lock()
         self.background: asyncio.Task | None = None
+        # Kodi put on screen by this driver and not left since (the Android TV integration cannot tell: its
+        # "source" stays "Google Play Store" or "Kodi" even after a sleep, when the home screen is back)
+        self.kodi_front = False
         self.last: dict = {}
         self.poll_task: asyncio.Task | None = None
         self.raw_catalog: dict = {}
@@ -303,17 +306,24 @@ class Driver:
         await self.remote.command(self.shield, "media_player.select_source", {"source": KODI_STORE})
         await asyncio.sleep(5)
         await self.remote.command(self.shield, "media_player.cursor_enter")
+        self.kodi_front = True
+
+    def watch_shield(self, a: dict) -> None:
+        """Forget that Kodi is on screen once the Shield sleeps, dreams or shows another app.
+        Kodi playing behind another app (or behind the home screen after a wake-up) is closed by Android."""
+        source = str(a.get("source") or "")
+        if a.get("state") in OFF_STATES or "backdrop" in source.lower() or source not in ("Kodi", "Google Play Store"):
+            self.kodi_front = False
 
     async def ensure_kodi(self, to_front: bool = False) -> bool:
         """Kodi running with its TV ready: wake the Shield, open Kodi when it does not run (or is behind)."""
         async with self.launch_lock:
             a = await self.shield_state()
-            if a.get("state") in OFF_STATES:
+            self.watch_shield(a)
+            if a.get("state") in OFF_STATES:  # it wakes up on the home screen
                 await self.remote.command(self.shield, "media_player.on")
                 await asyncio.sleep(8)
-                a = await self.shield_state()
-            dreaming = "backdrop" in str(a.get("source") or "").lower()  # screensaver: Kodi is paused
-            if to_front or dreaming or not await self.kodi.alive():
+            if to_front or not self.kodi_front or not await self.kodi.alive():
                 await self.bring_kodi()
             for _ in range(30):
                 if await self.kodi.alive() and await self.kodi.pvr_ready():
@@ -534,6 +544,7 @@ class Driver:
 
     async def current_attrs(self) -> dict:
         a = await self.shield_state()
+        self.watch_shield(a)
         state = a.get("state") or mp.States.UNKNOWN
         if state in OFF_STATES:
             return {mp.Attributes.STATE: state, mp.Attributes.MEDIA_TITLE: "", mp.Attributes.MEDIA_ARTIST: "",
