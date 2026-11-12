@@ -389,7 +389,9 @@ class Driver:
         with open(self.path("hidden.json"), "w", encoding="utf-8") as file:
             json.dump(hidden, file)
         self.hidden = hidden
-        self.rebuild()
+        # rebuilt in the event loop like after a playlist import: one rebuild after the other, the last one
+        # with the latest choice (a rebuild here could finish before one started earlier without it)
+        self.loop.call_soon_threadsafe(self.rebuild)
         _LOG.info("Hidden: %d categories, %d channel lists", len(hidden["categories"]), len(hidden["channels"]))
 
     # ------------------------------------------------------------- configuration

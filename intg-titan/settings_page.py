@@ -112,6 +112,12 @@ def start(port: int, get_catalog, get_hidden, save_hidden, import_m3u=None, feed
             pass
 
         def _send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
+            try:
+                self._write(code, body, ctype, headers)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the interface gave up a picture (list scrolled away)
+
+        def _write(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
             self.send_response(code)
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
