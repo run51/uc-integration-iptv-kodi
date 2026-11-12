@@ -1,0 +1,32 @@
+{
+  "driver_id": "titan_player",
+  "version": "0.1.0-test1",
+  "min_core_api": "0.20.0",
+  "name": {"en": "Titan Player", "fr": "Titan Player"},
+  "icon": "uc:tv",
+  "description": {
+    "en": "Browse the IPTV channels of Titan Player by category, with their logos, and play one on the Android TV box.",
+    "fr": "Parcourir les chaînes IPTV de Titan Player par catégorie, avec leurs logos, et en lancer une sur la box Android TV."
+  },
+  "port": 9096,
+  "developer": {"name": "run51", "url": "https://github.com/run51"},
+  "home_page": "https://github.com/run51",
+  "release_date": "2026-11-12",
+  "setup_data_schema": {
+    "title": {"en": "Titan Player", "fr": "Titan Player"},
+    "settings": [
+      {"id": "info", "label": {"en": "Titan Player", "fr": "Titan Player"},
+       "field": {"label": {"value": {
+         "en": "The driver plays a channel through the Remote's own API and the Android TV integration of the box running Titan Player.",
+         "fr": "Le pilote lance une chaîne via l'API de la remote et l'intégration Android TV de la box où tourne Titan Player."}}}},
+      {"id": "remote_url", "label": {"en": "Remote address", "fr": "Adresse de la remote"},
+       "field": {"text": {"value": "http://127.0.0.1"}}},
+      {"id": "api_key", "label": {"en": "Remote API key", "fr": "Clé API de la remote"},
+       "field": {"password": {"value": ""}}},
+      {"id": "shield", "label": {"en": "Android TV media player entity", "fr": "Entité lecteur Android TV"},
+       "field": {"text": {"value": "uc_androidtv_driver.main.48B02D36F2DF"}}},
+      {"id": "account", "label": {"en": "Titan Player account number", "fr": "Numéro de compte Titan Player"},
+       "field": {"number": {"value": 1, "min": 1, "max": 99, "steps": 1, "decimals": 0}}}
+    ]
+  }
+}
