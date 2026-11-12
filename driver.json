@@ -1,6 +1,6 @@
 {
   "driver_id": "titan_player",
-  "version": "0.1.0-test2",
+  "version": "0.1.0-test3",
   "min_core_api": "0.20.0",
   "name": {"en": "Titan Player", "fr": "Titan Player"},
   "icon": "uc:tv",

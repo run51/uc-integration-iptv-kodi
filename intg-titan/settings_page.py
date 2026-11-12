@@ -27,10 +27,10 @@ main{padding:12px max(16px,env(safe-area-inset-left)) 40px;max-width:1100px;marg
 .cat.hidden{opacity:.55}.head{display:flex;align-items:center;gap:10px;padding:10px 12px;cursor:pointer}
 .head .name{flex:1;font-weight:600}.head .count{color:var(--mute);font-size:13px}
 .tools{display:flex;gap:8px;padding:0 12px 8px}.tools button{background:none;border:1px solid var(--line);color:var(--mute);border-radius:6px;padding:4px 10px;cursor:pointer}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px;padding:0 12px 12px}
-.ch{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;border:1px solid var(--line);cursor:pointer;min-width:0}
-.ch.off{opacity:.4}.ch img{width:44px;height:30px;object-fit:contain;background:#000;border-radius:4px;flex:none}
-.ch span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:6px;padding:0 12px 12px}
+.ch{display:flex;align-items:center;gap:10px;padding:8px 10px;min-height:52px;border-radius:8px;border:1px solid var(--line);cursor:pointer;min-width:0}
+.ch.off{opacity:.4}.ch img{width:56px;height:38px;object-fit:contain;background:#000;border-radius:4px;flex:none}
+.ch span{overflow-wrap:anywhere;font-size:14px;line-height:1.3}
 input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);flex:none}
 .chev{color:var(--mute);width:16px}
 </style></head><body>
@@ -65,7 +65,7 @@ function render(){const q=fold($("#q").value);const L=$("#list");L.innerHTML="";
    d.appendChild(t);const g=document.createElement("div");g.className="grid";
    for(const h of chs){const off=isChHidden(c.id,h.id);const e=document.createElement("label");e.className="ch"+(off?" off":"");
     e.innerHTML=`<input type="checkbox" ${off?"":"checked"}><img loading="lazy" alt=""><span></span>`;
-    e.querySelector("span").textContent=h.name;if(h.logo)e.querySelector("img").src=h.logo;else e.querySelector("img").style.visibility="hidden";
+    e.querySelector("span").textContent=h.name;e.title=h.name;if(h.logo)e.querySelector("img").src=h.logo;else e.querySelector("img").style.visibility="hidden";
     e.querySelector("input").onchange=ev=>{setCh(c.id,h.id,ev.target.checked);e.classList.toggle("off",!ev.target.checked);save();
      d.querySelector(".count").textContent=c.channels.filter(x=>!isChHidden(c.id,x.id)).length+"/"+c.channels.length};
     g.appendChild(e)}d.appendChild(g)}
