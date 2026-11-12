@@ -31,27 +31,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import epg
 from catalog import kodi_lineup
+from feed import build_m3u
 
 _LOG = logging.getLogger("kodi_feed")
 REFRESH_S = 6 * 3600
-CATCHUP_DAYS = 7
-
-
-def esc(text: str) -> str:
-    return (text or "").replace('"', "'").replace("\n", " ").strip()
-
-
-def build_m3u(lineup: list[tuple[str, dict]], ids: dict[int, str], stream_base: str, epg_url: str = "") -> str:
-    head = f'#EXTM3U x-tvg-url="{epg_url}"' if epg_url else "#EXTM3U"
-    lines = [head]
-    for number, (group, ch) in enumerate(lineup, 1):
-        lines.append(
-            f'#EXTINF:-1 tvg-id="{esc(ids.get(ch["id"], ""))}" tvg-name="{esc(ch["name"])}" '
-            f'tvg-logo="{esc(ch.get("logo", ""))}" tvg-chno="{number}" group-title="{esc(group)}" '
-            f'catchup="xc" catchup-days="{CATCHUP_DAYS}",{esc(ch["name"])}'
-        )
-        lines.append(f"{stream_base.rstrip('/')}/{ch['id']}")
-    return "\n".join(lines) + "\n"
 
 
 def reduce_guide(raw: bytes, wanted: set[str]) -> bytes:

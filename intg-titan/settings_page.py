@@ -1,12 +1,16 @@
 # ruff: noqa: E501  (the embedded HTML page keeps long lines)
-"""Settings web page of the integration: choose the categories and channels shown on the remote.
+"""Settings web page of the integration: import the IPTV playlist, choose the categories and channels shown.
 
-Served on the local network (port 9097 by default): GET / the page, GET /api/catalog the full catalog with
-the hidden lists, POST /api/hidden saves them (hidden.json in the config directory) and reloads the driver.
+Served on the local network: GET / the page, GET /api/catalog the full catalog with the hidden lists and the
+playlist status, POST /api/hidden saves them (hidden.json in the config directory) and reloads the driver,
+POST /api/m3u imports the provider's M3U playlist (body = the file). GET /kodi.m3u and /epg.xml.gz: the
+playlist and guide for Kodi, only to the allowed addresses (the stream addresses carry the provider login).
 """
 
 import json
 import logging
+import os
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -17,7 +21,7 @@ _LOG = logging.getLogger("titan.settings")
 
 PAGE = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>IPTV — chaînes</title>
+<title>IPTV — réglages</title>
 <style>
 :root{--bg:#0f1115;--panel:#181b22;--line:#2a2f3a;--fg:#e8eaf0;--mute:#9aa3b2;--accent:#4da6ff;--off:#5b6270}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -38,10 +42,12 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);flex:none
 .chev{color:var(--mute);width:16px}
 .opt{display:flex;gap:8px;align-items:center;margin-top:8px;color:var(--mute);font-size:14px;cursor:pointer}
 .ch.auto{opacity:.4}.ch .why{display:block;color:var(--mute);font-size:12px}
+.imp{margin-top:8px;color:var(--mute);font-size:14px}.btn{border:1px solid var(--line);border-radius:6px;padding:5px 12px;cursor:pointer;color:var(--fg)}
 </style></head><body>
 <header><h1>IPTV — chaînes affichées sur la remote et dans Kodi</h1>
 <div class="row"><input type="search" id="q" placeholder="Rechercher une chaîne ou une catégorie…">
 <span class="stat" id="stat"></span><span class="saved" id="saved"></span></div>
+<div class="row imp"><span id="pl">Playlist : …</span><label class="btn">Importer la playlist (.m3u)<input type="file" id="m3u" accept=".m3u,.m3u8" hidden></label></div>
 <label class="opt"><input type="checkbox" id="p4k"> Garder seulement la version 4K d'une chaîne quand elle existe (les autres versions servent encore au replay)</label></header>
 <main id="list"></main>
 <script>
@@ -80,12 +86,24 @@ function render(){const q=fold($("#q").value);const L=$("#list");L.innerHTML="";
   L.appendChild(d)}stat()}
 $("#q").oninput=render;
 $("#p4k").onchange=e=>{hidden.prefer_4k=e.target.checked;save();render()};
-fetch("api/catalog").then(r=>r.json()).then(j=>{cat=j.catalog.categories;hidden=Object.assign({categories:[],channels:{},prefer_4k:true},j.hidden);$("#p4k").checked=hidden.prefer_4k!==false;render()});
+function showPlaylist(p){$("#pl").textContent=p&&p.channels?`Playlist : ${p.channels} chaînes en direct, importée le ${p.imported||"?"}`:"Playlist : aucune, importe le fichier M3U de ton fournisseur"}
+$("#m3u").onchange=async e=>{const f=e.target.files[0];if(!f)return;$("#pl").textContent="Import en cours…";
+ const r=await fetch("api/m3u",{method:"POST",body:f});const j=await r.json().catch(()=>({}));
+ if(!r.ok){$("#pl").textContent="Import refusé : "+(j.error||r.status);return}load()};
+function load(){fetch("api/catalog").then(r=>r.json()).then(j=>{cat=j.catalog.categories;hidden=Object.assign({categories:[],channels:{},prefer_4k:true},j.hidden);$("#p4k").checked=hidden.prefer_4k!==false;showPlaylist(j.playlist);render()})}
+load();
 </script></body></html>"""
 
 
-def start(port: int, get_catalog, get_hidden, save_hidden) -> ThreadingHTTPServer:
-    """Serve the settings page in a background thread."""
+MAX_PLAYLIST = 300 * 1024 * 1024
+
+
+def start(port: int, get_catalog, get_hidden, save_hidden, import_m3u=None, feed=None, allowed=None,
+          playlist=None) -> ThreadingHTTPServer:
+    """Serve the settings page in a background thread.
+
+    import_m3u(path) -> {"channels": n} | raises ValueError; feed(path) -> (bytes, content type) | None;
+    allowed(ip) -> bool for the Kodi files; playlist() -> {"channels", "imported"}."""
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -100,6 +118,18 @@ def start(port: int, get_catalog, get_hidden, save_hidden) -> ThreadingHTTPServe
             self.wfile.write(body)
 
         def do_GET(self):  # noqa: N802
+            path = self.path.split("?")[0]
+            if path in ("/kodi.m3u", "/epg.xml.gz") and feed:
+                if allowed and not allowed(self.client_address[0]):
+                    _LOG.warning("Refused %s %s", self.client_address[0], path)
+                    self._send(403, b"forbidden", "text/plain")
+                    return
+                found = feed(path)
+                if found is None:
+                    self._send(503, b"not ready", "text/plain")
+                else:
+                    self._send(200, found[0], found[1])
+                return
             if self.path in ("/", "/index.html"):
                 self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             elif self.path == "/api/catalog":
@@ -107,12 +137,39 @@ def start(port: int, get_catalog, get_hidden, save_hidden) -> ThreadingHTTPServe
                     {**cat, "channels": [{**ch, "key": base_name(ch["name"]), "uhd": is_4k(ch["name"])}
                                          for ch in cat["channels"]]}
                     for cat in (get_catalog() or {}).get("categories", [])]}
-                body = json.dumps({"catalog": catalog, "hidden": get_hidden()}, ensure_ascii=False)
+                body = json.dumps({"catalog": catalog, "hidden": get_hidden(),
+                                   "playlist": playlist() if playlist else None}, ensure_ascii=False)
                 self._send(200, body.encode(), "application/json")
             else:
                 self._send(404, b"not found", "text/plain")
 
+        def import_playlist(self) -> None:
+            """The M3U file is written to a temporary file as it comes (it can be ~40 MB), then read."""
+            length = int(self.headers.get("Content-Length") or 0)
+            if not import_m3u or not 0 < length <= MAX_PLAYLIST:
+                self._send(400, json.dumps({"error": "fichier absent ou trop gros"}).encode(), "application/json")
+                return
+            fd, tmp = tempfile.mkstemp(suffix=".m3u")
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    left = length
+                    while left > 0:
+                        chunk = self.rfile.read(min(left, 65536))
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        left -= len(chunk)
+                result = import_m3u(tmp)
+                self._send(200, json.dumps(result).encode(), "application/json")
+            except ValueError as ex:
+                self._send(400, json.dumps({"error": str(ex)}, ensure_ascii=False).encode(), "application/json")
+            finally:
+                os.unlink(tmp)
+
         def do_POST(self):  # noqa: N802
+            if self.path == "/api/m3u":
+                self.import_playlist()
+                return
             if self.path != "/api/hidden":
                 self._send(404, b"not found", "text/plain")
                 return

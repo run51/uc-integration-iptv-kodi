@@ -3,3 +3,14 @@ __pycache__/
 catalog.json
 config.json
 state.json
+
+# Playlist and private data of the integration (never in the repository)
+*.m3u
+*.m3u8
+catalog.json
+hidden.json
+streams.json
+state.json
+config.json
+*.xml.gz
+config/

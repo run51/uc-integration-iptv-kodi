@@ -7,6 +7,7 @@ words ("TF1 4K HDR UHD (Résolution Exclus)" -> "tf1" -> the guide channel named
 
 import gzip
 import io
+import os
 import re
 import time
 import unicodedata
@@ -43,39 +44,80 @@ def parse_time(value: str) -> int:
     return int(dt.replace(tzinfo=timezone.utc).timestamp())
 
 
-def parse(raw: bytes, wanted: set[str], now: float | None = None) -> tuple[dict[str, str], dict[str, list[dict]]]:
+def open_source(source):
+    """A readable binary stream of the XMLTV data: file path (gzipped or not) or bytes."""
+    if isinstance(source, (bytes, bytearray)):
+        data = io.BytesIO(source)
+    else:
+        data = open(source, "rb")  # noqa: SIM115 - closed by the caller
+    head = data.read(2)
+    data.seek(0)
+    return gzip.GzipFile(fileobj=data) if head == b"\x1f\x8b" else data
+
+
+def elements(source):
+    """(tag, element) of each <channel> and <programme>, read as a stream (the French guide is ~100 MB of XML:
+    the parsed elements are dropped from the tree as soon as they are handed over)."""
+    stream = open_source(source)
+    try:
+        context = ET.iterparse(stream, events=("start", "end"))
+        _, root = next(context)
+        for event, el in context:
+            if event == "end" and el.tag in ("channel", "programme"):
+                yield el.tag, el
+                root.clear()
+    finally:
+        stream.close()
+
+
+def parse(source, wanted: set[str], now: float | None = None, reduced: str | None = None
+          ) -> tuple[dict[str, str], dict[str, list[dict]]]:
     """(guide channel id -> folded display names joined, guide id -> programmes) for the wanted ids.
 
-    wanted may be empty: then all channel names are returned and no programme (first pass for name matching).
+    source: path of the XMLTV file (gzipped or not) or its bytes. wanted may be empty: then all channel names
+    are returned and no programme (first pass for name matching). reduced: path of a gzipped XMLTV file to
+    write with only the wanted channels and their programmes (the guide served to Kodi).
     """
     now = now or time.time()
-    if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
     names: dict[str, str] = {}
     progs: dict[str, list[dict]] = {}
-    for _, el in ET.iterparse(io.BytesIO(raw), events=("end",)):
-        if el.tag == "channel":
-            names[el.get("id", "")] = "|".join(base_name(d.text or "") for d in el.findall("display-name"))
-            el.clear()
-        elif el.tag == "programme":
+    out = gzip.open(reduced + ".tmp", "wb") if reduced else None
+    if out:
+        out.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="uc-intg-iptv-kodi">\n')
+    try:
+        for tag, el in elements(source):
+            if tag == "channel":
+                cid = el.get("id", "")
+                names[cid] = "|".join(base_name(d.text or "") for d in el.findall("display-name"))
+                if out and cid in wanted:
+                    out.write(ET.tostring(el, encoding="utf-8"))
+                continue
             cid = el.get("channel", "")
-            if cid in wanted:
-                try:
-                    start, stop = parse_time(el.get("start", "")), parse_time(el.get("stop", ""))
-                except (ValueError, IndexError):
-                    el.clear()
-                    continue
-                if stop > now - KEEP_BEFORE_S and start < now + KEEP_AFTER_S:
-                    icon = el.find("icon")
-                    progs.setdefault(cid, []).append({
-                        "start": start, "stop": stop,
-                        "title": (el.findtext("title") or "").strip(),
-                        "sub": (el.findtext("sub-title") or "").strip(),
-                        "cat": (el.findtext("category") or "").strip(),
-                        "desc": (el.findtext("desc") or "").strip()[:400],
-                        "icon": icon.get("src", "") if icon is not None else "",
-                    })
-            el.clear()
+            if cid not in wanted:
+                continue
+            if out:
+                out.write(ET.tostring(el, encoding="utf-8"))
+            try:
+                start, stop = parse_time(el.get("start", "")), parse_time(el.get("stop", ""))
+            except (ValueError, IndexError):
+                continue
+            if stop > now - KEEP_BEFORE_S and start < now + KEEP_AFTER_S:
+                icon = el.find("icon")
+                progs.setdefault(cid, []).append({
+                    "start": start, "stop": stop,
+                    "title": (el.findtext("title") or "").strip(),
+                    "sub": (el.findtext("sub-title") or "").strip(),
+                    "cat": (el.findtext("category") or "").strip(),
+                    "icon": icon.get("src", "") if icon is not None else "",
+                })
+        if out:
+            out.write(b"</tv>\n")
+            out.close()
+            os.replace(reduced + ".tmp", reduced)
+            out = None
+    finally:
+        if out:
+            out.close()
     for lst in progs.values():
         lst.sort(key=lambda p: p["start"])
     return names, progs

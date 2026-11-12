@@ -1,0 +1,72 @@
+# Builds the Remote installation archive (aarch64, Python runtime packed by PyInstaller) when a version tag
+# is pushed. Private repository: the archive is committed to the "build" branch, fetched there with git.
+name: "Build"
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+env:
+  # Python version of the Unfolded Circle PyInstaller builder image.
+  PYTHON_VER: 3.11.12-0.3.0
+
+jobs:
+  build:
+    name: Build archive
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Version and id
+        shell: bash
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+          echo "DRIVER_ID=$(jq .driver_id -r driver.json)" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU (the builder image is arm64)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build
+        shell: bash
+        run: |
+          docker run --rm --platform=linux/arm64 \
+            --user="$(id -u):$(id -g)" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            docker.io/unfoldedcircle/r2-pyinstaller:${PYTHON_VER} \
+            bash -c "cd /workspace && \
+              python -m pip install -r requirements.txt && \
+              pyinstaller --clean --onedir --collect-all tzdata \
+                --name intg-${DRIVER_ID} intg-titan/driver.py"
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p artifacts/bin
+          mv dist/intg-${DRIVER_ID}/* artifacts/bin
+          mv artifacts/bin/intg-${DRIVER_ID} artifacts/bin/driver
+          jq --arg v "$VERSION" '.version = $v' driver.json > artifacts/driver.json
+          NAME="uc-intg-${DRIVER_ID}-${VERSION}-aarch64"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          tar czf "/tmp/$NAME.tar.gz" -C artifacts .
+          (cd /tmp && sha256sum "$NAME.tar.gz" > "$NAME.sha256")
+          ls -lah /tmp/$NAME.*
+
+      - name: Publish to the build branch
+        shell: bash
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout --orphan build-out
+          git rm -rf . -q
+          git clean -fdxq
+          cp "/tmp/$NAME.tar.gz" "/tmp/$NAME.sha256" .
+          git add .
+          git commit -q -m "Build $NAME"
+          git push -f origin HEAD:build

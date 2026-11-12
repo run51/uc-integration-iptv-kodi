@@ -15,6 +15,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +23,8 @@ import urllib.request
 from datetime import datetime, timezone
 
 import epg
+import feed
+import m3u
 import settings_page
 import ucapi
 from catalog import Catalog, day_label, hhmm, is_4k
@@ -42,6 +45,7 @@ ANDROID_LOG = "intg-androidtv"  # log service of the Remote's Android TV integra
 STREAM_START_S = 10  # a 4K channel silent for this long is replaced by its FHD version
 REPLAY_CHECK_S = 12  # after starting a replay, time to see whether the provider sent the programme or live TV
 OFF_STATES = ("OFF", "STANDBY", "UNAVAILABLE")
+SETTINGS_PORT = 9300  # the Remote refuses 8000-9200 to custom integrations
 
 FEATURES = [
     mp.Features.ON_OFF,
@@ -158,6 +162,8 @@ class Driver:
         self.check_task: asyncio.Task | None = None
         self.launch_lock = asyncio.Lock()
         self.background: asyncio.Task | None = None
+        self.stream_base = ""  # "http://host:port/user/pass" of the provider (private, never logged)
+        self.feed_cache: bytes | None = None
         # Kodi put on screen by this driver and not left since (the Android TV integration cannot tell: its
         # "source" stays "Google Play Store" or "Kodi" even after a sleep, when the home screen is back)
         self.kodi_front = False
@@ -172,6 +178,7 @@ class Driver:
 
     def rebuild(self) -> None:
         self.catalog = Catalog(self.raw_catalog, self.hidden, self.guide, self.no_replay)
+        self.feed_cache = None
         self.by_kodi_name = {}
         for cat in self.catalog.categories:
             for ch in cat["channels"]:
@@ -189,35 +196,38 @@ class Driver:
         except OSError:
             pass
 
-    async def load_guide(self, download: bool = True) -> None:
-        """Download the public guide (or read the cached copy) and keep the programmes of the catalog."""
-        raw = None
-        if download:
-            for url in epg.SOURCES:
-                try:
-                    raw = await asyncio.to_thread(
-                        lambda u=url: urllib.request.urlopen(urllib.request.Request(u, headers={
-                            "User-Agent": "uc-intg-titan-player"}), timeout=120).read())
-                    with open(self.path("epg.xml.gz"), "wb") as file:
-                        file.write(raw)
-                    break
-                except (OSError, ValueError, urllib.error.URLError) as ex:
-                    _LOG.warning("Guide download %s failed: %s", url, ex)
-        if raw is None:
+    def download_guide(self) -> None:
+        """Public guide written to the config directory as it comes (~9 MB gzipped)."""
+        for url in epg.SOURCES:
+            tmp = self.path("epg.xml.gz.part")
             try:
-                with open(self.path("epg.xml.gz"), "rb") as file:
-                    raw = file.read()
-            except OSError:
+                req = urllib.request.Request(url, headers={"User-Agent": "uc-intg-iptv-kodi"})
+                with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+                    shutil.copyfileobj(resp, out, 65536)
+                os.replace(tmp, self.path("epg.xml.gz"))
                 return
-        channels = Catalog(self.raw_catalog).channels()
+            except (OSError, ValueError) as ex:
+                _LOG.warning("Guide download %s failed: %s", url, ex)
+
+    async def load_guide(self, download: bool = True) -> None:
+        """Download the public guide (or use the copy kept), keep the programmes of the catalog channels and
+        write the reduced guide served to Kodi. Read as a stream: the Remote gives ~100 MB to an integration."""
+        if download:
+            await asyncio.to_thread(self.download_guide)
+        source = self.path("epg.xml.gz")
+        if not os.path.exists(source):
+            return
+        # all the channels of the playlist, hidden ones too: the replay of a 4K channel uses its FHD version
+        channels = [ch for cat in self.raw_catalog.get("categories", []) for ch in cat["channels"]]
 
         def work():
-            names, _ = epg.parse(raw, set())
+            names, _ = epg.parse(source, set())
             ids = epg.match_ids(channels, names)
-            _, progs = epg.parse(raw, set(ids.values()))
+            _, progs = epg.parse(source, set(ids.values()), reduced=self.path("kodi_epg.xml.gz"))
             return epg.Guide(progs, ids)
 
         self.guide = await asyncio.to_thread(work)
+        self.feed_cache = None
         self.rebuild()
         count = sum(len(v) for v in self.guide.progs.values())
         _LOG.info("Guide: %d channels, %d programmes", len(self.guide.ids), count)
@@ -233,6 +243,54 @@ class Driver:
             except Exception as ex:  # noqa: BLE001 - keep the loop alive
                 _LOG.warning("Guide refresh failed: %s", ex)
                 await asyncio.sleep(EPG_RETRY_S)
+
+    # ------------------------------------------------------- playlist and Kodi feed
+    def import_m3u(self, path: str) -> dict:
+        """Called from the settings page thread with the uploaded playlist: catalog + private stream base."""
+        catalog, base = m3u.parse_file(path)
+        count = m3u.channel_count(catalog)
+        if not count or not base:
+            raise ValueError("aucune chaîne en direct au format Xtream dans ce fichier")
+        with open(self.path("catalog.json"), "w", encoding="utf-8") as file:
+            json.dump(catalog, file, ensure_ascii=False, separators=(",", ":"))
+        tmp = self.path("streams.json.tmp")
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as file:
+            json.dump({"stream_base": base}, file)
+        os.replace(tmp, self.path("streams.json"))
+        _LOG.info("Playlist imported: %d categories, %d live channels", len(catalog["categories"]), count)
+        self.loop.call_soon_threadsafe(self.use_catalog, catalog, base)
+        return {"categories": len(catalog["categories"]), "channels": count}
+
+    def use_catalog(self, catalog: dict, base: str) -> None:
+        self.raw_catalog, self.stream_base, self.feed_cache = catalog, base, None
+        self.rebuild()
+        asyncio.ensure_future(self.load_guide(download=not os.path.exists(self.path("epg.xml.gz"))))
+
+    def playlist_status(self) -> dict:
+        path = self.path("streams.json")
+        if not os.path.exists(path):
+            return {"channels": 0}
+        when = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%d/%m/%Y %H:%M")
+        return {"channels": m3u.channel_count(self.raw_catalog), "imported": when}
+
+    def feed_allowed(self, ip: str) -> bool:
+        kodi_host = urllib.parse.urlsplit(self.kodi.url).hostname
+        return ip in (kodi_host, "127.0.0.1")
+
+    def feed_file(self, path: str) -> tuple[bytes, str] | None:
+        """Kodi's playlist (built from the channels shown + their versions kept for the replay) or guide."""
+        if path == "/epg.xml.gz":
+            try:
+                with open(self.path("kodi_epg.xml.gz"), "rb") as file:
+                    return file.read(), "application/gzip"
+            except OSError:
+                return None
+        if not self.stream_base or not self.catalog.lineup:
+            return None
+        if self.feed_cache is None:
+            ids = self.guide.ids if self.guide else {}
+            self.feed_cache = feed.build_m3u(self.catalog.lineup, ids, self.stream_base).encode()
+        return self.feed_cache, "audio/x-mpegurl; charset=utf-8"
 
     def save_hidden(self, hidden: dict) -> None:
         """Called from the settings page thread: store the hidden lists and rebuild the browsed catalog."""
@@ -259,6 +317,7 @@ class Driver:
         self.remote = RemoteApi(cfg["remote_url"], cfg["api_key"])
         self.shield = cfg.get("shield") or DEFAULT_SHIELD
         self.kodi = Kodi(cfg.get("kodi_url") or KODI_URL, cfg.get("kodi_auth") or "")
+        self.stream_base = (self.load_json("streams.json") or {}).get("stream_base", "")
         self.raw_catalog = self.load_json("catalog.json") or {}
         self.hidden = self.load_json("hidden.json") or {}
         state = self.load_json("state.json") or {}
@@ -267,10 +326,12 @@ class Driver:
         if self.epg_task is None or self.epg_task.done():
             self.epg_task = asyncio.get_event_loop().create_task(self.guide_loop())
         if self.settings_server is None:
-            port = int(os.getenv("TITAN_SETTINGS_PORT", "9097"))
+            port = int(os.getenv("TITAN_SETTINGS_PORT", str(SETTINGS_PORT)))
             try:
                 self.settings_server = settings_page.start(
-                    port, lambda: self.raw_catalog, lambda: self.hidden, self.save_hidden)
+                    port, lambda: self.raw_catalog, lambda: self.hidden, self.save_hidden,
+                    import_m3u=self.import_m3u, feed=self.feed_file, allowed=self.feed_allowed,
+                    playlist=self.playlist_status)
             except OSError as ex:
                 _LOG.warning("Settings page not started on port %d: %s", port, ex)
         if state.get("category") and state.get("stream"):
