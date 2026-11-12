@@ -8,7 +8,9 @@ Media ids:
   root               the categories, in the provider's order (as in Titan Player)
   cat:<cat>          a category: first the "Programme TV" row, then its channels (tap = play at once)
   guide:<cat>        the same channels, tap = the channel's programme page (the remote has no long press)
-  ch:<cat>:<stream>  a channel: played with the iptvtitan://channel/<account>/<stream> link; browsed = its programme
+  ch:<cat>:<stream>  a channel: played in Kodi; browsed = its programme page
+  past:<cat>:<stream>          the programmes already aired (replay), the most recent first
+  rp:<cat>:<stream>:<start>    one of them: played in Kodi from the provider's catch-up
 """
 
 import time
@@ -27,6 +29,7 @@ ROOT = "root"
 CATEGORY_ICON = "icon://uc:list"
 GUIDE_ICON = "icon://uc:calendar-days"
 CHANNEL_ICON = "icon://uc:tv"
+REPLAY_ICON = "icon://uc:arrow-rotate-left"
 
 
 def hhmm(ts: float) -> str:
@@ -38,12 +41,15 @@ def hhmm(ts: float) -> str:
 
 
 def day_label(ts: float, now: float | None = None) -> str:
-    """"" today, "demain " tomorrow (programme lists span ~36 h)."""
+    """"" today, "demain " tomorrow, "hier " yesterday (programme lists span yesterday to ~36 h ahead)."""
     from datetime import datetime
 
     now = now or time.time()
     d = datetime.fromtimestamp(ts, LOCAL_TZ).date()
-    return "" if d == datetime.fromtimestamp(now, LOCAL_TZ).date() else "demain "
+    today = datetime.fromtimestamp(now, LOCAL_TZ).date()
+    if d == today:
+        return ""
+    return "demain " if d > today else ("hier " if (today - d).days == 1 else d.strftime("%d/%m "))
 
 
 def fold(text: str) -> str:
@@ -70,10 +76,29 @@ def apply_filter(data: dict, hidden: dict | None) -> dict:
 
 
 class Catalog:
-    def __init__(self, data: dict, hidden: dict | None = None, guide=None):
+    def __init__(self, data: dict, hidden: dict | None = None, guide=None, no_replay: set | None = None):
         self.categories = [c for c in apply_filter(data, hidden)["categories"] if c.get("channels")]
         self.by_id = {c["id"]: c for c in self.categories}
         self.guide = guide  # epg.Guide or None
+        self.no_replay = no_replay if no_replay is not None else set()  # channels seen without catch-up
+
+    def number(self, stream_id: int) -> int | None:
+        """Channel number in Kodi: the feed numbers the visible channels in the catalog order from 1."""
+        n = 0
+        for cat in self.categories:
+            for ch in cat["channels"]:
+                n += 1
+                if ch["id"] == stream_id:
+                    return n
+        return None
+
+    def find(self, stream_id: int) -> tuple[dict, dict] | None:
+        """(category, channel) of a stream id (the first category holding it)."""
+        for cat in self.categories:
+            for ch in cat["channels"]:
+                if ch["id"] == stream_id:
+                    return cat, ch
+        return None
 
     def channels(self) -> list[dict]:
         return [ch for c in self.categories for ch in c["channels"]]
@@ -98,11 +123,21 @@ class Catalog:
         return None
 
     @staticmethod
-    def parse_channel_id(media_id: str) -> tuple[str, int] | None:
+    def parse_channel_id(media_id: str, prefix: str = "ch") -> tuple[str, int] | None:
         parts = (media_id or "").split(":")
-        if len(parts) == 3 and parts[0] == "ch" and parts[2].isdigit():
+        if len(parts) == 3 and parts[0] == prefix and parts[2].isdigit():
             return parts[1], int(parts[2])
         return None
+
+    @staticmethod
+    def parse_replay_id(media_id: str) -> tuple[str, int, int] | None:
+        parts = (media_id or "").split(":")
+        if len(parts) == 4 and parts[0] == "rp" and parts[2].isdigit() and parts[3].isdigit():
+            return parts[1], int(parts[2]), int(parts[3])
+        return None
+
+    def has_replay(self, stream_id: int) -> bool:
+        return bool(self.guide and stream_id not in self.no_replay and self.guide.past(stream_id, 1))
 
     def channel_item(
         self, cat: dict, ch: dict, with_category: bool = False, subtitle: str | None = None, guide_mode: bool = False
@@ -125,6 +160,16 @@ class Catalog:
     def programme_items(self, cat: dict, ch: dict) -> list[BrowseMediaItem]:
         items = []
         now = time.time()
+        if self.has_replay(ch["id"]):
+            items.append(BrowseMediaItem(
+                media_id=f"past:{cat['id']}:{ch['id']}",
+                title="Déjà diffusé",
+                subtitle="Revoir un programme passé (replay)",
+                media_class=MediaClass.DIRECTORY,
+                media_type=MediaContentType.VIDEO,
+                can_browse=True,
+                thumbnail=REPLAY_ICON,
+            ))
         for p in self.guide.upcoming(ch["id"]) if self.guide else []:
             when = f"{day_label(p['start'], now)}{hhmm(p['start'])}–{hhmm(p['stop'])}"
             on_air = p["start"] <= now < p["stop"]
@@ -138,6 +183,19 @@ class Catalog:
                 thumbnail=p.get("icon") or ch.get("logo") or CHANNEL_ICON,
             ))
         return items
+
+    def past_items(self, cat: dict, ch: dict) -> list[BrowseMediaItem]:
+        now = time.time()
+        return [BrowseMediaItem(
+            media_id=f"rp:{cat['id']}:{ch['id']}:{p['start']}",
+            title=p["title"] + (f" – {p['sub']}" if p.get("sub") else ""),
+            subtitle=f"{day_label(p['start'], now)}{hhmm(p['start'])}–{hhmm(p['stop'])}"
+            + (f" · {p['cat']}" if p.get("cat") else ""),
+            media_class=MediaClass.VIDEO,
+            media_type=MediaContentType.VIDEO,
+            can_play=True,
+            thumbnail=p.get("icon") or ch.get("logo") or CHANNEL_ICON,
+        ) for p in (self.guide.past(ch["id"]) if self.guide else [])]
 
     def category_item(self, cat: dict) -> BrowseMediaItem:
         return BrowseMediaItem(
@@ -156,7 +214,7 @@ class Catalog:
         media_id = media_id or ROOT
         if media_id == ROOT:
             container = BrowseMediaItem(
-                media_id=ROOT, title="Titan Player", media_class=MediaClass.DIRECTORY,
+                media_id=ROOT, title="IPTV", media_class=MediaClass.DIRECTORY,
                 media_type=MediaContentType.CHANNELS, can_browse=True, can_search=True,
             )
             return container, [self.category_item(c) for c in self.categories]
@@ -178,6 +236,14 @@ class Catalog:
                 media_type=MediaContentType.CHANNELS, can_browse=True, thumbnail=GUIDE_ICON,
             )
             return container, [self.channel_item(cat, ch, guide_mode=True) for ch in cat["channels"]]
+        parsed = self.parse_channel_id(media_id, "past")
+        if parsed and self.channel(*parsed):
+            cat, ch = self.by_id[parsed[0]], self.channel(*parsed)
+            container = BrowseMediaItem(
+                media_id=media_id, title=f"Déjà diffusé · {ch['name']}", media_class=MediaClass.DIRECTORY,
+                media_type=MediaContentType.VIDEO, can_browse=True, thumbnail=ch.get("logo") or REPLAY_ICON,
+            )
+            return container, self.past_items(cat, ch)
         parsed = self.parse_channel_id(media_id)
         if parsed and self.channel(*parsed):
             cat, ch = self.by_id[parsed[0]], self.channel(*parsed)

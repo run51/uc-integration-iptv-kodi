@@ -1,8 +1,10 @@
-"""Titan Player integration for the Unfolded Circle Remote: browse the IPTV channels by category, with
-their logos, and play one on the Android TV box (NVIDIA Shield) running Titan Player.
+"""IPTV integration for the Unfolded Circle Remote: browse the IPTV channels by category, with their logos and
+the TV guide, and watch them, live or in replay, in Kodi on the Android TV box (NVIDIA Shield).
 
-Chain: Remote → this driver → the Remote's own Core REST API → the Android TV integration's media player
-       → select_source "iptvtitan://channel/<account>/<stream>" → Titan Player opens the live channel.
+Chain: Remote → this driver → Kodi JSON-RPC (PVR IPTV Simple Client fed by tools/kodi_feed.py with the same
+       catalog) → Player.Open channel / broadcast.
+Kodi is brought to the front through the Remote's own Core REST API and the Android TV integration (the Shield
+refuses the usual "market://launch" app link: its Play Store page is opened and "Ouvrir" pressed).
 
 The channel catalog (categories, names, stream ids, logos; no login) is built from the provider's M3U
 playlist by tools/build_catalog.py and read from catalog.json (config directory, else next to the driver).
@@ -22,17 +24,21 @@ from datetime import datetime, timezone
 import epg
 import settings_page
 import ucapi
-from catalog import Catalog, hhmm
+from catalog import Catalog, day_label, hhmm
+from kodi_client import DEFAULT_URL as KODI_URL
+from kodi_client import Kodi, KodiError, kodi_name, utc_ts
 from ucapi import media_player as mp
 
 _LOG = logging.getLogger("titan")
-ENTITY_ID = "titan_player"
+ENTITY_ID = "titan_player"  # kept from the Titan Player versions: activities and pages refer to it
 DEFAULT_SHIELD = "uc_androidtv_driver.main.48B02D36F2DF"
 DEFAULT_LIMIT, MAX_LIMIT = 50, 100
 POLL_S = 5
 EPG_REFRESH_S = 6 * 3600
 EPG_RETRY_S = 15 * 60
-TITAN_APP = "titan"  # the Android TV player names the open app "Titan Player - IPTV"
+KODI_STORE = "https://play.google.com/store/apps/details?id=org.xbmc.kodi"
+REPLAY_CHECK_S = 12  # after starting a replay, time to see whether the provider sent the programme or live TV
+OFF_STATES = ("OFF", "STANDBY", "UNAVAILABLE")
 
 FEATURES = [
     mp.Features.ON_OFF,
@@ -41,6 +47,8 @@ FEATURES = [
     mp.Features.STOP,
     mp.Features.NEXT,
     mp.Features.PREVIOUS,
+    mp.Features.FAST_FORWARD,
+    mp.Features.REWIND,
     mp.Features.CHANNEL_SWITCHER,
     mp.Features.MEDIA_TITLE,
     mp.Features.MEDIA_ARTIST,
@@ -52,14 +60,17 @@ FEATURES = [
     mp.Features.BROWSE_MEDIA,
     mp.Features.SEARCH_MEDIA,
 ]
-FORWARD = {  # commands passed on to the Shield's media player as they are
-    mp.Commands.ON: "media_player.on",
-    mp.Commands.OFF: "media_player.off",
-    mp.Commands.TOGGLE: "media_player.toggle",
-    mp.Commands.PLAY_PAUSE: "media_player.play_pause",
-    mp.Commands.STOP: "media_player.stop",
-}
 STEP = {mp.Commands.NEXT: 1, mp.Commands.CHANNEL_UP: 1, mp.Commands.PREVIOUS: -1, mp.Commands.CHANNEL_DOWN: -1}
+SEEK = {mp.Commands.FAST_FORWARD: "smallforward", mp.Commands.REWIND: "smallbackward"}
+ERRORS = (OSError, ValueError, urllib.error.URLError, KodiError)
+
+
+def item_ts(text: str) -> float | None:
+    """Times of the item playing ("2026-11-12 14:45:00", UTC like the broadcasts) -> unix time."""
+    try:
+        return utc_ts(text)
+    except (TypeError, ValueError):
+        return None
 
 
 class RemoteApi:
@@ -99,7 +110,7 @@ class TitanPlayer(mp.MediaPlayer):
     def __init__(self, driver: "Driver"):
         super().__init__(
             ENTITY_ID,
-            {"en": "Titan Player", "fr": "Titan Player"},
+            {"en": "IPTV", "fr": "IPTV"},
             FEATURES,
             {mp.Attributes.STATE: mp.States.UNKNOWN},
             device_class=mp.DeviceClasses.TV,
@@ -120,9 +131,15 @@ class Driver:
         self.api = ucapi.IntegrationAPI(loop)
         self.remote: RemoteApi | None = None
         self.shield = DEFAULT_SHIELD
-        self.account = 1
+        self.kodi = Kodi()
+        self.no_replay: set[int] = set()  # channels whose provider sent live TV instead of a past programme
+        self.by_kodi_name: dict[str, tuple[str, int]] = {}
         self.catalog = Catalog({})
         self.current: tuple[str, int] | None = None  # (category id, stream id) last played
+        self.replay: dict | None = None  # {"stream", "start", "stop", "title"} of the replay started last
+        self.check_task: asyncio.Task | None = None
+        self.launch_lock = asyncio.Lock()
+        self.background: asyncio.Task | None = None
         self.last: dict = {}
         self.poll_task: asyncio.Task | None = None
         self.raw_catalog: dict = {}
@@ -133,7 +150,21 @@ class Driver:
         self.programme_key = None  # (stream, start) of the programme whose position was last sent
 
     def rebuild(self) -> None:
-        self.catalog = Catalog(self.raw_catalog, self.hidden, self.guide)
+        self.catalog = Catalog(self.raw_catalog, self.hidden, self.guide, self.no_replay)
+        self.by_kodi_name = {}
+        for cat in self.catalog.categories:
+            for ch in cat["channels"]:
+                self.by_kodi_name.setdefault(kodi_name(ch["name"]), (cat["id"], ch["id"]))
+
+    def save_state(self) -> None:
+        state = {"no_replay": sorted(self.no_replay)}
+        if self.current:
+            state.update(category=self.current[0], stream=self.current[1])
+        try:
+            with open(self.path("state.json"), "w", encoding="utf-8") as file:
+                json.dump(state, file)
+        except OSError:
+            pass
 
     async def load_guide(self, download: bool = True) -> None:
         """Download the public guide (or read the cached copy) and keep the programmes of the catalog."""
@@ -204,9 +235,11 @@ class Driver:
     def configure(self, cfg: dict) -> None:
         self.remote = RemoteApi(cfg["remote_url"], cfg["api_key"])
         self.shield = cfg.get("shield") or DEFAULT_SHIELD
-        self.account = int(cfg.get("account") or 1)
+        self.kodi = Kodi(cfg.get("kodi_url") or KODI_URL, cfg.get("kodi_auth") or "")
         self.raw_catalog = self.load_json("catalog.json") or {}
         self.hidden = self.load_json("hidden.json") or {}
+        state = self.load_json("state.json") or {}
+        self.no_replay = {int(x) for x in state.get("no_replay") or []}
         self.rebuild()
         if self.epg_task is None or self.epg_task.done():
             self.epg_task = asyncio.get_event_loop().create_task(self.guide_loop())
@@ -217,12 +250,12 @@ class Driver:
                     port, lambda: self.raw_catalog, lambda: self.hidden, self.save_hidden)
             except OSError as ex:
                 _LOG.warning("Settings page not started on port %d: %s", port, ex)
-        state = self.load_json("state.json") or {}
         if state.get("category") and state.get("stream"):
             self.current = (str(state["category"]), int(state["stream"]))
         if not self.api.available_entities.contains(ENTITY_ID):
             self.api.available_entities.add(TitanPlayer(self))
-        _LOG.info("Remote %s, Shield %s, %d categories", self.remote.base, self.shield, len(self.catalog.categories))
+        _LOG.info("Remote %s, Shield %s, Kodi %s, %d categories", self.remote.base, self.shield, self.kodi.url,
+                  len(self.catalog.categories))
 
     async def setup_handler(self, msg: ucapi.SetupDriver) -> ucapi.SetupAction:
         if isinstance(msg, ucapi.DriverSetupRequest):
@@ -231,7 +264,7 @@ class Driver:
                 "remote_url": (data.get("remote_url") or "http://127.0.0.1").strip(),
                 "api_key": (data.get("api_key") or "").strip(),
                 "shield": (data.get("shield") or DEFAULT_SHIELD).strip(),
-                "account": int(float(data.get("account") or 1)),
+                "kodi_url": (data.get("kodi_url") or KODI_URL).strip(),
             }
             try:
                 await RemoteApi(cfg["remote_url"], cfg["api_key"]).entity(cfg["shield"])
@@ -262,18 +295,133 @@ class Driver:
                                 pagination=ucapi.Pagination(page=page, limit=limit, count=len(items)))
 
     # -------------------------------------------------------------- commands
-    async def play_channel(self, cat_id: str, stream_id: int) -> ucapi.StatusCodes:
-        link = f"iptvtitan://channel/{self.account}/{stream_id}"
-        _LOG.info("Play %s (%s)", link, cat_id)
-        await self.remote.command(self.shield, "media_player.select_source", {"source": link})
+    async def shield_state(self) -> dict:
+        return (await self.remote.entity(self.shield)).get("attributes") or {}
+
+    async def bring_kodi(self) -> None:
+        _LOG.info("Opening Kodi (Play Store page, then Ouvrir)")
+        await self.remote.command(self.shield, "media_player.select_source", {"source": KODI_STORE})
+        await asyncio.sleep(5)
+        await self.remote.command(self.shield, "media_player.cursor_enter")
+
+    async def ensure_kodi(self, to_front: bool = False) -> bool:
+        """Kodi running with its TV ready: wake the Shield, open Kodi when it does not run (or is behind)."""
+        async with self.launch_lock:
+            a = await self.shield_state()
+            if a.get("state") in OFF_STATES:
+                await self.remote.command(self.shield, "media_player.on")
+                await asyncio.sleep(8)
+                a = await self.shield_state()
+            dreaming = "backdrop" in str(a.get("source") or "").lower()  # screensaver: Kodi is paused
+            if to_front or dreaming or not await self.kodi.alive():
+                await self.bring_kodi()
+            for _ in range(30):
+                if await self.kodi.alive() and await self.kodi.pvr_ready():
+                    return True
+                await asyncio.sleep(2)
+            _LOG.warning("Kodi did not answer")
+            return False
+
+    async def wait_player(self, seconds: float) -> bool:
+        for _ in range(int(seconds * 2)):
+            if await self.kodi.player():
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def open_item(self, item: dict) -> None:
+        """Player.Open; when nothing starts (Kodi behind another app is paused), bring Kodi to the front."""
+        await self.kodi.call("Player.Open", {"item": item})
+        if not await self.wait_player(4):
+            await self.ensure_kodi(to_front=True)
+            if not await self.wait_player(6):
+                await self.kodi.call("Player.Open", {"item": item})
+
+    async def soon(self, action, *args) -> ucapi.StatusCodes:
+        """Answer the Remote at once and play in the background: waking the Shield, opening Kodi and checking
+        that the picture starts take longer than the Remote waits for a command. A new command replaces the
+        one still running (several CH+ in a row: only the last channel is opened)."""
+        if self.background and not self.background.done():
+            self.background.cancel()
+
+        async def later():
+            try:
+                await action(*args)
+            except asyncio.CancelledError:
+                raise
+            except ERRORS as ex:
+                _LOG.warning("%s failed: %s", action.__name__, ex)
+            except Exception:  # noqa: BLE001 - never lose the error of a background task
+                _LOG.exception("%s failed", action.__name__)
+
+        self.background = asyncio.create_task(later())
+        return ucapi.StatusCodes.OK
+
+    async def kodi_channel(self, stream_id: int) -> int | None:
+        found = self.catalog.find(stream_id)
+        if not found:
+            return None
+        return await self.kodi.channel_id(found[1]["name"], self.catalog.number(stream_id))
+
+    async def open_kodi(self) -> ucapi.StatusCodes:
+        return ucapi.StatusCodes.OK if await self.ensure_kodi() else ucapi.StatusCodes.SERVICE_UNAVAILABLE
+
+    def remember(self, cat_id: str, stream_id: int) -> None:
         self.current = (cat_id, stream_id)
-        try:
-            with open(self.path("state.json"), "w", encoding="utf-8") as file:
-                json.dump({"category": cat_id, "stream": stream_id}, file)
-        except OSError:
-            pass
+        self.save_state()
+
+    async def play_channel(self, cat_id: str, stream_id: int) -> ucapi.StatusCodes:
+        if not await self.ensure_kodi():
+            return ucapi.StatusCodes.SERVICE_UNAVAILABLE
+        cid = await self.kodi_channel(stream_id)
+        if cid is None:
+            _LOG.warning("Channel %s not found in Kodi", stream_id)
+            return ucapi.StatusCodes.NOT_FOUND
+        _LOG.info("Play channel %s (Kodi %s)", stream_id, cid)
+        await self.open_item({"channelid": cid})
+        self.replay = None
+        self.remember(cat_id, stream_id)
         await self.refresh()
         return ucapi.StatusCodes.OK
+
+    async def play_replay(self, cat_id: str, stream_id: int, start: int) -> ucapi.StatusCodes:
+        prog = next((p for p in (self.guide.programmes(stream_id) if self.guide else []) if p["start"] == start), None)
+        if not await self.ensure_kodi():
+            return ucapi.StatusCodes.SERVICE_UNAVAILABLE
+        cid = await self.kodi_channel(stream_id)
+        bid = await self.kodi.broadcast_id(cid, start) if cid is not None else None
+        if bid is None:
+            _LOG.warning("Programme %s of channel %s not found in Kodi", start, stream_id)
+            return ucapi.StatusCodes.NOT_FOUND
+        _LOG.info("Play replay %s at %s (Kodi broadcast %s)", stream_id, start, bid)
+        await self.open_item({"broadcastid": bid})
+        self.replay = {"stream": stream_id, "start": start, "stop": prog["stop"] if prog else start,
+                       "title": prog["title"] if prog else ""}
+        self.remember(cat_id, stream_id)
+        if self.check_task and not self.check_task.done():
+            self.check_task.cancel()
+        self.check_task = asyncio.create_task(self.check_replay(stream_id, start))
+        await self.refresh()
+        return ucapi.StatusCodes.OK
+
+    async def check_replay(self, stream_id: int, start: int) -> None:
+        """Providers send live TV for a channel without catch-up: then hide its "Déjà diffusé" row from now on."""
+        await asyncio.sleep(REPLAY_CHECK_S)
+        try:
+            pl = await self.kodi.player()
+        except KodiError:
+            return
+        if not pl or not self.replay or self.replay.get("stream") != stream_id:
+            return
+        began = item_ts(pl["item"].get("starttime"))
+        if began is not None and abs(began - start) > 300:
+            _LOG.info("Channel %s has no replay (Kodi plays the programme of %s)", stream_id,
+                      pl["item"].get("starttime"))
+            self.no_replay.add(stream_id)
+            self.replay = None
+            self.save_state()
+            self.rebuild()
+            await self.refresh()
 
     async def on_command(self, entity, cmd_id: str, params: dict | None, websocket=None):
         params = params or {}
@@ -281,64 +429,133 @@ class Driver:
             return ucapi.StatusCodes.SERVICE_UNAVAILABLE
         try:
             if cmd_id == mp.Commands.PLAY_MEDIA:
-                parsed = Catalog.parse_channel_id(str(params.get("media_id") or ""))
+                media_id = str(params.get("media_id") or "")
+                replay = Catalog.parse_replay_id(media_id)
+                if replay and self.catalog.channel(replay[0], replay[1]):
+                    return await self.soon(self.play_replay, *replay)
+                parsed = Catalog.parse_channel_id(media_id)
                 if not parsed or not self.catalog.channel(*parsed):
                     return ucapi.StatusCodes.NOT_FOUND
-                return await self.play_channel(*parsed)
+                return await self.soon(self.play_channel, *parsed)
             if cmd_id in STEP:
                 if not self.current:
                     return ucapi.StatusCodes.SERVICE_UNAVAILABLE
                 ch = self.catalog.neighbour(*self.current, STEP[cmd_id])
-                return await self.play_channel(self.current[0], ch["id"]) if ch else ucapi.StatusCodes.NOT_FOUND
-            if cmd_id in FORWARD:
-                await self.remote.command(self.shield, FORWARD[cmd_id])
+                if not ch:
+                    return ucapi.StatusCodes.NOT_FOUND
+                self.current = (self.current[0], ch["id"])  # the next CH+ counts from here at once
+                return await self.soon(self.play_channel, *self.current)
+            if cmd_id == mp.Commands.TOGGLE:
+                cmd_id = mp.Commands.OFF if self.last.get(mp.Attributes.STATE) in (
+                    mp.States.PLAYING, mp.States.PAUSED, mp.States.ON) else mp.Commands.ON
+            if cmd_id == mp.Commands.ON:  # Kodi on the last channel watched
+                if self.current and self.catalog.channel(*self.current):
+                    return await self.soon(self.play_channel, *self.current)
+                return await self.soon(self.open_kodi)
+            if cmd_id == mp.Commands.OFF:
+                try:
+                    pl = await self.kodi.player()
+                    if pl:
+                        await self.kodi.call("Player.Stop", {"playerid": pl["playerid"]})
+                except KodiError:
+                    pass
+                await self.remote.command(self.shield, "media_player.off")
                 await self.refresh()
                 return ucapi.StatusCodes.OK
-        except (OSError, ValueError, urllib.error.URLError) as ex:
+            if cmd_id in (mp.Commands.PLAY_PAUSE, mp.Commands.STOP) or cmd_id in SEEK:
+                pl = await self.kodi.player()
+                if not pl:
+                    return ucapi.StatusCodes.OK
+                if cmd_id == mp.Commands.PLAY_PAUSE:
+                    await self.kodi.call("Player.PlayPause", {"playerid": pl["playerid"]})
+                elif cmd_id == mp.Commands.STOP:
+                    await self.kodi.call("Player.Stop", {"playerid": pl["playerid"]})
+                else:
+                    await self.kodi.call("Player.Seek", {"playerid": pl["playerid"], "value": {"step": SEEK[cmd_id]}})
+                await self.refresh()
+                return ucapi.StatusCodes.OK
+        except ERRORS as ex:
             _LOG.warning("Command %s failed: %s", cmd_id, ex)
             return ucapi.StatusCodes.SERVICE_UNAVAILABLE
         return ucapi.StatusCodes.NOT_IMPLEMENTED
 
     # ----------------------------------------------------------------- state
-    def attributes(self, shield: dict) -> dict:
-        a = shield.get("attributes") or {}
-        state = a.get("state") or mp.States.UNKNOWN
-        app = a.get("media_title") or ""
-        attrs = {mp.Attributes.STATE: state, mp.Attributes.MEDIA_TYPE: "channel",
-                 mp.Attributes.MEDIA_TITLE: app, mp.Attributes.MEDIA_ARTIST: "",
-                 mp.Attributes.MEDIA_IMAGE_URL: a.get("media_image_url") or ""}
-        in_titan = TITAN_APP in app.lower() or TITAN_APP in str(a.get("source") or "").lower()
-        if in_titan and self.current and state not in ("OFF", "STANDBY", "UNAVAILABLE"):
-            cat = self.catalog.by_id.get(self.current[0])
-            ch = self.catalog.channel(*self.current)
-            if cat and ch:
-                attrs[mp.Attributes.MEDIA_TITLE] = ch["name"]
-                attrs[mp.Attributes.MEDIA_ARTIST] = cat["name"]
-                attrs[mp.Attributes.MEDIA_IMAGE_URL] = ch.get("logo") or attrs[mp.Attributes.MEDIA_IMAGE_URL]
-                attrs[mp.Attributes.STATE] = mp.States.PLAYING if state in ("ON", "PLAYING") else state
-                p = self.guide.now(ch["id"]) if self.guide else None
-                if p:  # "Plus belle la vie" / "TF1 FHD · 14:00–14:25" with the programme image and its progress
-                    attrs[mp.Attributes.MEDIA_TITLE] = p["title"]
-                    attrs[mp.Attributes.MEDIA_ARTIST] = f"{hhmm(p['start'])}–{hhmm(p['stop'])} · {ch['name']}"
-                    attrs[mp.Attributes.MEDIA_IMAGE_URL] = p.get("icon") or attrs[mp.Attributes.MEDIA_IMAGE_URL]
-                    attrs[mp.Attributes.MEDIA_DURATION] = p["stop"] - p["start"]
-                    key = (ch["id"], p["start"])
-                    if key != self.programme_key or mp.Attributes.MEDIA_POSITION not in self.last:
-                        attrs[mp.Attributes.MEDIA_POSITION] = int(time.time() - p["start"])
-                        attrs[mp.Attributes.MEDIA_POSITION_UPDATED_AT] = datetime.now(timezone.utc).isoformat()
-                        self.programme_key = key
-                else:
-                    attrs[mp.Attributes.MEDIA_DURATION] = 0
-                    attrs[mp.Attributes.MEDIA_POSITION] = 0
-                    self.programme_key = None
+    def programme_attrs(self, attrs: dict, ch: dict, p: dict, position: int, duration: int, artist: str,
+                        resync: bool = False) -> None:
+        """Programme shown with its progress; the position is sent again only for a new programme (the remote
+        moves the bar itself while playing), or every 30 s in replay where Kodi's position is the reference."""
+        attrs[mp.Attributes.MEDIA_TITLE] = p["title"]
+        attrs[mp.Attributes.MEDIA_ARTIST] = artist
+        attrs[mp.Attributes.MEDIA_IMAGE_URL] = p.get("icon") or ch.get("logo") or ""
+        attrs[mp.Attributes.MEDIA_DURATION] = duration
+        key = (ch["id"], p["start"], position // 30 if resync else 0, attrs[mp.Attributes.STATE])
+        if key != self.programme_key or mp.Attributes.MEDIA_POSITION not in self.last:
+            attrs[mp.Attributes.MEDIA_POSITION] = position
+            attrs[mp.Attributes.MEDIA_POSITION_UPDATED_AT] = datetime.now(timezone.utc).isoformat()
+            self.programme_key = key
+
+    def kodi_attrs(self, pl: dict | None) -> dict:
+        attrs = {mp.Attributes.STATE: mp.States.ON, mp.Attributes.MEDIA_TYPE: "channel",
+                 mp.Attributes.MEDIA_TITLE: "Kodi", mp.Attributes.MEDIA_ARTIST: "", mp.Attributes.MEDIA_IMAGE_URL: ""}
+        no_progress = {mp.Attributes.MEDIA_DURATION: 0, mp.Attributes.MEDIA_POSITION: 0}
+        if not pl:
+            self.programme_key = None
+            return {**attrs, **no_progress}
+        item = pl["item"]
+        attrs[mp.Attributes.STATE] = mp.States.PAUSED if pl["speed"] == 0 else mp.States.PLAYING
+        attrs[mp.Attributes.MEDIA_TITLE] = item.get("title") or item.get("label") or ""
+        found = self.by_kodi_name.get(item.get("channel") or "")
+        if not found:
+            self.programme_key = None
+            return {**attrs, **no_progress}
+        cat, ch = self.catalog.by_id[found[0]], self.catalog.channel(*found)
+        if self.current != found and (not self.current or self.current[1] != found[1]):
+            self.remember(*found)  # zapped in Kodi itself: CH+/- and the next start follow
+        attrs[mp.Attributes.MEDIA_TITLE] = ch["name"]
+        attrs[mp.Attributes.MEDIA_ARTIST] = cat["name"]
+        attrs[mp.Attributes.MEDIA_IMAGE_URL] = ch.get("logo") or ""
+        began = item_ts(item.get("starttime"))
+        now = time.time()
+        live = self.guide.now(ch["id"]) if self.guide else None
+        # a programme opened from the guide (not the channel) that began before the one on air: replay
+        if item.get("type") != "channel" and began is not None and (not live or began < live["start"] - 60):
+            progs = self.guide.programmes(ch["id"]) if self.guide else []
+            p = next((x for x in progs if abs(x["start"] - began) < 120), None)
+            p = p or {"title": item.get("title") or "", "start": began, "stop": item_ts(item.get("endtime")) or began}
+            when = f"{day_label(p['start'], now)}{hhmm(p['start'])}–{hhmm(p['stop'])}"
+            self.programme_attrs(attrs, ch, p, pl["time"], pl["total"], f"Replay · {when} · {ch['name']}", True)
+        elif live:  # "Plus belle la vie" / "14:00–14:25 · TF1 FHD" with the programme image and its progress
+            self.programme_attrs(attrs, ch, live, int(now - live["start"]), live["stop"] - live["start"],
+                                 f"{hhmm(live['start'])}–{hhmm(live['stop'])} · {ch['name']}")
+        else:
+            self.programme_key = None
+            attrs.update(no_progress)
         return attrs
+
+    async def current_attrs(self) -> dict:
+        a = await self.shield_state()
+        state = a.get("state") or mp.States.UNKNOWN
+        if state in OFF_STATES:
+            return {mp.Attributes.STATE: state, mp.Attributes.MEDIA_TITLE: "", mp.Attributes.MEDIA_ARTIST: "",
+                    mp.Attributes.MEDIA_IMAGE_URL: "", mp.Attributes.MEDIA_DURATION: 0, mp.Attributes.MEDIA_POSITION: 0}
+        try:
+            pl = await self.kodi.player() if await self.kodi.alive() else False
+        except KodiError as ex:
+            _LOG.debug("Kodi state unavailable: %s", ex)
+            pl = False
+        if pl or (pl is None and str(a.get("source") or "") in ("Kodi", "Google Play Store")):
+            return self.kodi_attrs(pl)
+        return {mp.Attributes.STATE: state, mp.Attributes.MEDIA_TYPE: "channel",  # another app is on screen
+                mp.Attributes.MEDIA_TITLE: a.get("media_title") or a.get("source") or "",
+                mp.Attributes.MEDIA_ARTIST: "", mp.Attributes.MEDIA_IMAGE_URL: a.get("media_image_url") or "",
+                mp.Attributes.MEDIA_DURATION: 0, mp.Attributes.MEDIA_POSITION: 0}
 
     async def refresh(self) -> None:
         if self.remote is None:
             return
         try:
-            attrs = self.attributes(await self.remote.entity(self.shield))
-        except (OSError, ValueError, urllib.error.URLError) as ex:
+            attrs = await self.current_attrs()
+        except ERRORS as ex:
             _LOG.debug("Shield state unavailable: %s", ex)
             attrs = {mp.Attributes.STATE: mp.States.UNAVAILABLE}
         changed = {k: v for k, v in attrs.items() if self.last.get(k) != v}

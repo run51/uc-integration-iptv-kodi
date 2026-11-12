@@ -1,6 +1,6 @@
 """TV guide (EPG) from a public XMLTV file (xmltvfr.fr for the French channels).
 
-Only the programmes of the channels of the catalog are kept, from a few hours ago to ~36 h ahead. A channel
+Only the programmes of the channels of the catalog are kept, from yesterday morning (replay) to ~36 h ahead. A channel
 is matched by its guide id (tvg-id of the M3U, e.g. "France2.fr"), else by its name without the quality
 words ("TF1 4K HDR UHD (Résolution Exclus)" -> "tf1" -> the guide channel named "TF1").
 """
@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 SOURCES = ["https://xmltvfr.fr/xmltv/xmltv_fr.xml.gz"]
-KEEP_BEFORE_S, KEEP_AFTER_S = 6 * 3600, 36 * 3600
+KEEP_BEFORE_S, KEEP_AFTER_S = 40 * 3600, 36 * 3600
 QUALITY = re.compile(
     r"\(.*?\)|\b(fhd\+?|uhd|hdr|hd|sd|4k|8k|low|hevc|h265|dolby digital|double audio|exclus\w*|"
     r"resolution|multi|backup|fr|vf|vost\w*)\b",
@@ -113,6 +113,11 @@ class Guide:
             if p["start"] <= at < p["stop"]:
                 return p
         return None
+
+    def past(self, stream_id: int, count: int = 60, at: float | None = None) -> list[dict]:
+        """Programmes already over (replay), the most recent first."""
+        at = at or time.time()
+        return [p for p in reversed(self.programmes(stream_id)) if p["stop"] <= at][:count]
 
     def upcoming(self, stream_id: int, count: int = 30, at: float | None = None) -> list[dict]:
         at = at or time.time()
