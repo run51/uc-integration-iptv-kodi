@@ -8,6 +8,7 @@ lists show 60 px pictures, the player card a few hundred) and serves it from the
 import hashlib
 import logging
 import os
+import ssl
 import threading
 import time
 import urllib.error
@@ -19,6 +20,20 @@ _LOG = logging.getLogger("titan.images")
 MAX_DOWNLOAD = 3 * 1024 * 1024
 MAX_SIDE = 320  # the player card is ~400 px wide; list pictures are 60 px
 USER_AGENT = "uc-intg-iptv-kodi"
+
+
+def tls_context() -> ssl.SSLContext:
+    """Certificates of certifi: the Python packed for the Remote has no system certificate store (the logos
+    are mostly on https://i.imgur.com)."""
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+TLS = tls_context()
 
 
 def shrink(data: bytes) -> tuple[bytes, str]:
@@ -81,7 +96,7 @@ class ImageCache:
                 return self.read(path)
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=20) as resp:
+                with urllib.request.urlopen(req, timeout=20, context=TLS) as resp:
                     data = resp.read(MAX_DOWNLOAD + 1)
             except urllib.error.HTTPError as ex:
                 if ex.code == 429:
