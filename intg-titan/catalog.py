@@ -6,8 +6,9 @@ catalog.json (built by tools/build_catalog.py from the provider's M3U playlist):
 
 Media ids:
   root               the categories, in the provider's order (as in Titan Player)
-  cat:<cat>          a category's channels
-  ch:<cat>:<stream>  a channel (played with the iptvtitan://channel/<account>/<stream> link)
+  cat:<cat>          a category: first the "Programme TV" row, then its channels (tap = play at once)
+  guide:<cat>        the same channels, tap = the channel's programme page (the remote has no long press)
+  ch:<cat>:<stream>  a channel: played with the iptvtitan://channel/<account>/<stream> link; browsed = its programme
 """
 
 import time
@@ -24,6 +25,7 @@ except Exception:  # noqa: BLE001 - no tz database: fall back to the system loca
 
 ROOT = "root"
 CATEGORY_ICON = "icon://uc:list"
+GUIDE_ICON = "icon://uc:calendar-days"
 CHANNEL_ICON = "icon://uc:tv"
 
 
@@ -103,11 +105,11 @@ class Catalog:
         return None
 
     def channel_item(
-        self, cat: dict, ch: dict, with_category: bool = False, subtitle: str | None = None
+        self, cat: dict, ch: dict, with_category: bool = False, subtitle: str | None = None, guide_mode: bool = False
     ) -> BrowseMediaItem:
-        """A channel row: tap = its programme page (when the guide knows it), the play icon = watch it."""
+        """A channel row: tap = watch it; in guide mode, tap = its programme page (the play icon still watches it)."""
         line = subtitle or self.now_line(ch["id"]) or (cat["name"] if with_category else None)
-        has_guide = bool(self.guide and self.guide.programmes(ch["id"]))
+        has_guide = guide_mode and bool(self.guide and self.guide.programmes(ch["id"]))
         return BrowseMediaItem(
             media_id=f"ch:{cat['id']}:{ch['id']}",
             title=ch["name"],
@@ -161,7 +163,21 @@ class Catalog:
         if media_id.startswith("cat:"):
             cat = self.by_id[media_id[4:]]
             container = self.category_item(cat)
-            return container, [self.channel_item(cat, ch) for ch in cat["channels"]]
+            items = [self.channel_item(cat, ch) for ch in cat["channels"]]
+            if self.guide and any(self.guide.programmes(ch["id"]) for ch in cat["channels"]):
+                items.insert(0, BrowseMediaItem(
+                    media_id=f"guide:{cat['id']}", title="Programme TV",
+                    subtitle="Voir le programme de chaque chaîne", media_class=MediaClass.DIRECTORY,
+                    media_type=MediaContentType.CHANNELS, can_browse=True, thumbnail=GUIDE_ICON,
+                ))
+            return container, items
+        if media_id.startswith("guide:"):
+            cat = self.by_id[media_id[6:]]
+            container = BrowseMediaItem(
+                media_id=media_id, title=f"Programme TV · {cat['name']}", media_class=MediaClass.DIRECTORY,
+                media_type=MediaContentType.CHANNELS, can_browse=True, thumbnail=GUIDE_ICON,
+            )
+            return container, [self.channel_item(cat, ch, guide_mode=True) for ch in cat["channels"]]
         parsed = self.parse_channel_id(media_id)
         if parsed and self.channel(*parsed):
             cat, ch = self.by_id[parsed[0]], self.channel(*parsed)
