@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import ssl
 import time
 import urllib.error
@@ -25,6 +26,7 @@ from datetime import datetime, timezone
 
 import epg
 import feed
+import images
 import m3u
 import settings_page
 import ucapi
@@ -74,6 +76,16 @@ FEATURES = [
 STEP = {mp.Commands.NEXT: 1, mp.Commands.CHANNEL_UP: 1, mp.Commands.PREVIOUS: -1, mp.Commands.CHANNEL_DOWN: -1}
 SEEK = {mp.Commands.FAST_FORWARD: "smallforward", mp.Commands.REWIND: "smallbackward"}
 ERRORS = (OSError, ValueError, urllib.error.URLError, KodiError)
+
+
+def lan_address() -> str:
+    """Address of the Remote on the local network (the pictures are also shown by the web configurator)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 9))  # no packet is sent: only the route is looked up
+            return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 def item_ts(text: str) -> float | None:
@@ -177,13 +189,15 @@ class Driver:
         self.hidden: dict = {}
         self.settings_server = None
         self.guide = KodiGuide()  # programmes asked to Kodi (it reads the public guide itself)
+        self.images: images.ImageCache | None = None
         self.guide_ids: dict[int, str] = {}  # stream id -> guide channel id, for the tvg-id of Kodi's playlist
         self.sid_by_kodi_name: dict[str, int] = {}
         self.epg_task: asyncio.Task | None = None
         self.programme_key = None  # (stream, start) of the programme whose position was last sent
 
     def rebuild(self) -> None:
-        self.catalog = Catalog(self.raw_catalog, self.hidden, self.guide, self.no_replay)
+        self.catalog = Catalog(self.raw_catalog, self.hidden, self.guide, self.no_replay,
+                               self.images.url_for if self.images else None)
         self.feed_cache = None
         self.sid_by_kodi_name = {}
         for _, ch in self.catalog.lineup:
@@ -300,12 +314,22 @@ class Driver:
         hour = datetime.now(LOCAL_TZ).hour
         return age > GUIDE_MAX_AGE_S or (age > 12 * 3600 and GUIDE_NIGHT[0] <= hour < GUIDE_NIGHT[1])
 
+    async def prefetch_logos(self) -> None:
+        """Logos of the channels shown (and kept for the replay) downloaded into the image cache, gently."""
+        if self.images:
+            urls = [ch.get("logo") for _, ch in self.catalog.lineup if ch.get("logo")]
+            done = await asyncio.to_thread(self.images.prefetch, urls)
+            if done:
+                _LOG.info("Image cache: %d channel logos downloaded", done)
+
     async def guide_loop(self) -> None:
         await self.load_guide(download=False)  # copy kept first: the channel ids at once
+        await self.prefetch_logos()  # only the logos missing (first start, new channels)
         while True:
             try:
                 if self.guide_due():
                     await self.load_guide()
+                    await self.prefetch_logos()
             except asyncio.CancelledError:
                 raise
             except Exception as ex:  # noqa: BLE001 - keep the loop alive
@@ -333,6 +357,7 @@ class Driver:
         self.raw_catalog, self.stream_base, self.feed_cache = catalog, base, None
         self.rebuild()
         asyncio.ensure_future(self.load_guide(download=not os.path.exists(self.path("epg.xml.gz"))))
+        asyncio.ensure_future(self.prefetch_logos())
 
     def playlist_status(self) -> dict:
         path = next((p for p in (self.path("streams.json"), self.path("catalog.json")) if os.path.exists(p)), None)
@@ -389,16 +414,19 @@ class Driver:
         self.hidden = self.load_json("hidden.json") or {}
         state = self.load_json("state.json") or {}
         self.no_replay = {int(x) for x in state.get("no_replay") or []}
+        port = int(os.getenv("TITAN_SETTINGS_PORT", str(SETTINGS_PORT)))
+        if self.images is None:
+            self.images = images.ImageCache(self.path("images"))
+            self.images.base = f"http://{lan_address()}:{port}"
         self.rebuild()
         if self.epg_task is None or self.epg_task.done():
             self.epg_task = asyncio.get_event_loop().create_task(self.guide_loop())
         if self.settings_server is None:
-            port = int(os.getenv("TITAN_SETTINGS_PORT", str(SETTINGS_PORT)))
             try:
                 self.settings_server = settings_page.start(
                     port, lambda: self.raw_catalog, lambda: self.hidden, self.save_hidden,
                     import_m3u=self.import_m3u, feed=self.feed_file, allowed=self.feed_allowed,
-                    playlist=self.playlist_status)
+                    playlist=self.playlist_status, image=self.images.get)
             except OSError as ex:
                 _LOG.warning("Settings page not started on port %d: %s", port, ex)
         if state.get("category") and state.get("stream"):
@@ -567,6 +595,9 @@ class Driver:
         self.background = asyncio.create_task(later())
         return ucapi.StatusCodes.OK
 
+    def img(self, url: str | None) -> str:
+        return self.images.url_for(url or "") if self.images else (url or "")
+
     async def kodi_channel(self, stream_id: int) -> int | None:
         name = self.catalog.names.get(stream_id)
         return await self.kodi.channel_id(name, self.catalog.number(stream_id)) if name else None
@@ -710,7 +741,7 @@ class Driver:
         moves the bar itself while playing), or every 30 s in replay where Kodi's position is the reference."""
         attrs[mp.Attributes.MEDIA_TITLE] = p["title"]
         attrs[mp.Attributes.MEDIA_ARTIST] = artist
-        attrs[mp.Attributes.MEDIA_IMAGE_URL] = p.get("icon") or ch.get("logo") or ""
+        attrs[mp.Attributes.MEDIA_IMAGE_URL] = self.img(p.get("icon") or ch.get("logo"))
         attrs[mp.Attributes.MEDIA_DURATION] = duration
         key = (ch["id"], p["start"], position // 30 if resync else 0, attrs[mp.Attributes.STATE])
         if key != self.programme_key or mp.Attributes.MEDIA_POSITION not in self.last:
@@ -738,7 +769,7 @@ class Driver:
         name = item.get("channel") or ch["name"]  # the version really playing ("M6 FHD" for M6 4K)
         attrs[mp.Attributes.MEDIA_TITLE] = name
         attrs[mp.Attributes.MEDIA_ARTIST] = cat["name"]
-        attrs[mp.Attributes.MEDIA_IMAGE_URL] = ch.get("logo") or ""
+        attrs[mp.Attributes.MEDIA_IMAGE_URL] = self.img(ch.get("logo"))
         began = item_ts(item.get("starttime"))
         now = time.time()
         if item.get("type") == "channel" and began is not None:  # live: the programme on air, as Kodi sees it

@@ -13,6 +13,7 @@ import logging
 import os
 import tempfile
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from catalog import is_4k
@@ -100,7 +101,7 @@ MAX_PLAYLIST = 300 * 1024 * 1024
 
 
 def start(port: int, get_catalog, get_hidden, save_hidden, import_m3u=None, feed=None, allowed=None,
-          playlist=None) -> ThreadingHTTPServer:
+          playlist=None, image=None) -> ThreadingHTTPServer:
     """Serve the settings page in a background thread.
 
     import_m3u(path) -> {"channels": n} | raises ValueError; feed(path) -> (bytes, content type[, mtime]) | None;
@@ -116,12 +117,21 @@ def start(port: int, get_catalog, get_hidden, save_hidden, import_m3u=None, feed
                 self.send_header(key, value)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            if "Cache-Control" not in (headers or {}):
+                self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):  # noqa: N802
             path = self.path.split("?")[0]
+            if path.startswith("/img/") and image:  # picture through the image cache (?u=original address)
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                found = image(query.get("u", [""])[0])
+                if found is None:
+                    self._send(404, b"not found", "text/plain")
+                else:
+                    self._send(200, found[0], found[1], {"Cache-Control": "max-age=31536000, immutable"})
+                return
             if path in ("/kodi.m3u", "/epg.xml.gz") and feed:
                 if allowed and not allowed(self.client_address[0]):
                     _LOG.warning("Refused %s %s", self.client_address[0], path)

@@ -133,10 +133,11 @@ def kodi_lineup(data: dict, hidden: dict | None) -> list[tuple[str, dict]]:
 
 
 class Catalog:
-    def __init__(self, data: dict, hidden: dict | None = None, guide=None, no_replay: set | None = None):
+    def __init__(self, data: dict, hidden: dict | None = None, guide=None, no_replay: set | None = None, img=None):
         self.categories = [c for c in apply_filter(data, hidden)["categories"] if c.get("channels")]
         self.by_id = {c["id"]: c for c in self.categories}
         self.guide = guide  # epg.Guide or None
+        self.img = img or (lambda url: url or "")  # picture address (through the integration's image cache)
         self.no_replay = no_replay if no_replay is not None else set()  # channels seen without catch-up
         self.twins = replay_twins(data, self.categories)
         self.lineup = kodi_lineup(data, hidden)
@@ -217,7 +218,7 @@ class Catalog:
             media_type=MediaContentType.CHANNEL,
             can_play=True,
             can_browse=has_guide,
-            thumbnail=ch.get("logo") or CHANNEL_ICON,
+            thumbnail=self.img(ch.get("logo")) or CHANNEL_ICON,
         )
 
     def programme_items(self, cat: dict, ch: dict, name_on_air: bool = False) -> list[BrowseMediaItem]:
@@ -247,7 +248,7 @@ class Catalog:
                 media_class=MediaClass.VIDEO,
                 media_type=MediaContentType.VIDEO,
                 can_play=on_air,
-                thumbnail=p.get("icon") or ch.get("logo") or CHANNEL_ICON,
+                thumbnail=self.img(p.get("icon") or ch.get("logo")) or CHANNEL_ICON,
             ))
         return items
 
@@ -261,7 +262,7 @@ class Catalog:
             media_class=MediaClass.VIDEO,
             media_type=MediaContentType.VIDEO,
             can_play=True,
-            thumbnail=p.get("icon") or ch.get("logo") or CHANNEL_ICON,
+            thumbnail=self.img(p.get("icon") or ch.get("logo")) or CHANNEL_ICON,
         ) for p in (self.guide.past(ch["id"]) if self.guide else [])]
 
     def category_item(self, cat: dict) -> BrowseMediaItem:
@@ -286,7 +287,7 @@ class Catalog:
             media_type=MediaContentType.CHANNEL,
             can_browse=True,
             can_play=True,
-            thumbnail=ch.get("logo") or CHANNEL_ICON,
+            thumbnail=self.img(ch.get("logo")) or CHANNEL_ICON,
         )
 
     def browse(self, media_id: str | None, current: tuple[str, int] | None = None
@@ -334,7 +335,7 @@ class Catalog:
             cat, ch = self.by_id[parsed[0]], self.channel(*parsed)
             container = BrowseMediaItem(
                 media_id=media_id, title=f"Déjà diffusé · {ch['name']}", media_class=MediaClass.DIRECTORY,
-                media_type=MediaContentType.VIDEO, can_browse=True, thumbnail=ch.get("logo") or REPLAY_ICON,
+                media_type=MediaContentType.VIDEO, can_browse=True, thumbnail=self.img(ch.get("logo")) or REPLAY_ICON,
             )
             return container, self.past_items(cat, ch)
         parsed = self.parse_channel_id(media_id)

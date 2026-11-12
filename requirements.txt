@@ -1,3 +1,4 @@
 ucapi==0.6.0
 tzdata
 certifi
+pillow
