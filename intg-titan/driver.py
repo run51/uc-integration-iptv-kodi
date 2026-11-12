@@ -406,11 +406,13 @@ class Driver:
             if not await self.wait_player(6):
                 await self.kodi.call("Player.Open", {"item": item})
 
-    async def wait_started(self, seconds: float) -> bool:
-        """The picture runs: a player with a time (a stream that does not answer leaves it at 0)."""
+    async def wait_started(self, seconds: float, stream_id: int) -> bool:
+        """The picture of this channel runs: a player on it with a time (a stream that does not answer
+        leaves it at 0; the channel opened just before may still be playing for a moment)."""
+        wanted = kodi_name(self.catalog.names.get(stream_id, ""))
         for _ in range(int(seconds)):
             pl = await self.kodi.player()
-            if pl and pl["time"] > 0:
+            if pl and pl["time"] > 0 and pl["item"].get("channel") == wanted:
                 return True
             await asyncio.sleep(1)
         return False
@@ -461,7 +463,7 @@ class Driver:
                 continue
             _LOG.info("Play channel %s (Kodi %s)%s", source, cid, f" instead of {stream_id}" if n else "")
             await self.open_item({"channelid": cid})
-            if not fallback or await self.wait_started(STREAM_START_S):
+            if not fallback or await self.wait_started(STREAM_START_S, source):
                 break
             _LOG.warning("Channel %s does not start", source)
         await self.refresh()
