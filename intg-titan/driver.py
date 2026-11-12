@@ -267,8 +267,8 @@ class Driver:
         asyncio.ensure_future(self.load_guide(download=not os.path.exists(self.path("epg.xml.gz"))))
 
     def playlist_status(self) -> dict:
-        path = self.path("streams.json")
-        if not os.path.exists(path):
+        path = next((p for p in (self.path("streams.json"), self.path("catalog.json")) if os.path.exists(p)), None)
+        if not path or not self.raw_catalog:
             return {"channels": 0}
         when = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%d/%m/%Y %H:%M")
         return {"channels": m3u.channel_count(self.raw_catalog), "imported": when}
