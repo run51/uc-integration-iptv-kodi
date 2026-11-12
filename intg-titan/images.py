@@ -4,8 +4,8 @@ The Remote's interface keeps pictures in memory for a while only and downloads t
 it needs them later (or after a restart). The integration keeps a small copy of each picture and serves it
 from the Remote itself.
 
-The Remote's processor is small and shared with its interface: pictures are downloaded and made smaller by
-ONE background worker, one after the other, gently. A picture not cached yet is not waited for: the
+The Remote's processor is small and shared with its interface: pictures are downloaded by ONE background
+worker, one after the other, gently, and kept as they are. A picture not cached yet is not waited for: the
 interface is sent to its original address (as without the cache) and the picture is queued for later.
 """
 
@@ -23,7 +23,6 @@ import urllib.request
 _LOG = logging.getLogger("titan.images")
 
 MAX_DOWNLOAD = 3 * 1024 * 1024
-MAX_SIDE = 240  # list pictures are 60 px, the player card a few hundred
 USER_AGENT = "uc-intg-iptv-kodi"
 PAUSE_S = 1.0  # between two downloads
 BACKOFF_S = 120.0  # after "429 Too Many Requests" (imgur, which hosts most logos, limits the rate)
@@ -43,25 +42,17 @@ def tls_context() -> ssl.SSLContext:
 TLS = tls_context()
 
 
-def shrink(data: bytes) -> tuple[bytes, str]:
-    """Picture made smaller (Pillow, when available); PNG keeps the transparency of the logos."""
-    try:
-        from io import BytesIO
-
-        from PIL import Image
-
-        img = Image.open(BytesIO(data))
-        img.draft("RGB", (MAX_SIDE, MAX_SIDE))  # JPEG: decoded directly at a reduced size
-        img.thumbnail((MAX_SIDE, MAX_SIDE))
-        out = BytesIO()
-        if img.mode in ("RGBA", "LA", "P"):
-            img.convert("RGBA").save(out, "PNG", compress_level=6)
-            return out.getvalue(), "image/png"
-        img.convert("RGB").save(out, "JPEG", quality=85)
-        return out.getvalue(), "image/jpeg"
-    except Exception:  # noqa: BLE001 - keep the original picture when it cannot be read
-        kind = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
-        return data, kind
+def kind_of(data: bytes) -> str:
+    """Content type of a picture kept as downloaded. Pictures are NOT made smaller on the Remote: decoding
+    and encoding them (Pillow) held the integration for seconds on its small processor, long enough for
+    the Remote to drop the connection; the interface scales them itself, as it did without the cache."""
+    if data[:4] == b"\x89PNG":
+        return "image/png"
+    if data[:3] == b"GIF":
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
 
 
 class ImageCache:
@@ -152,12 +143,10 @@ class ImageCache:
             return False
         if not data or len(data) > MAX_DOWNLOAD:
             return False
-        small, kind = shrink(data)
         path = self.path(self.key(url))
         tmp = path + ".tmp"
         with open(tmp, "wb") as file:
-            file.write(b"P" if kind == "image/png" else b"J")
-            file.write(small)
+            file.write(data)
         os.replace(tmp, path)
         self.done += 1
         return False
@@ -169,7 +158,7 @@ class ImageCache:
                 data = file.read()
         except OSError:
             return None
-        return data[1:], "image/png" if data[:1] == b"P" else "image/jpeg"
+        return data, kind_of(data)
 
     def trim(self) -> None:
         """Drop the pictures used least recently above the size limit."""

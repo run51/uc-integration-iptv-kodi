@@ -52,6 +52,7 @@ STREAM_START_S = 10  # a 4K channel silent for this long is replaced by its FHD 
 REPLAY_CHECK_S = 12  # after starting a replay, time to see whether the provider sent the programme or live TV
 OFF_STATES = ("OFF", "STANDBY", "UNAVAILABLE")
 SETTINGS_PORT = 9300  # the Remote refuses 8000-9200 to custom integrations
+PREPARE_S = 3.0  # longest wait for Kodi's programmes before showing a page without them
 
 FEATURES = [
     mp.Features.ON_OFF,
@@ -460,8 +461,15 @@ class Driver:
         return ucapi.SetupError()
 
     # -------------------------------------------------------------- browsing
+    async def prepare_briefly(self, media_id: str | None) -> None:
+        """Programmes from Kodi, but never make the Remote wait long: without them after a few seconds."""
+        try:
+            await asyncio.wait_for(self.prepare(media_id), PREPARE_S)
+        except asyncio.TimeoutError:
+            _LOG.debug("Kodi too slow: page shown without the programmes")
+
     async def browse(self, options: mp.BrowseOptions):
-        await self.prepare(options.media_id)
+        await self.prepare_briefly(options.media_id)
         playing = self.last.get(mp.Attributes.STATE) in (mp.States.PLAYING, mp.States.PAUSED)
         try:
             container, items = self.catalog.browse(options.media_id, self.current if playing else None)
@@ -472,7 +480,7 @@ class Driver:
         return mp.BrowseResults(media=container, pagination=ucapi.Pagination(page=page, limit=limit, count=len(items)))
 
     async def search(self, options: mp.SearchOptions):
-        await self.prepare("root")
+        await self.prepare_briefly("root")
         items = self.catalog.search(options.query)
         page, limit = page_bounds(options.paging)
         return mp.SearchResults(media=items[(page - 1) * limit : page * limit],
