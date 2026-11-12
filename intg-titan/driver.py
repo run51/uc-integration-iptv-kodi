@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 import epg
 import settings_page
 import ucapi
-from catalog import Catalog, day_label, hhmm
+from catalog import Catalog, day_label, hhmm, is_4k
 from kodi_client import DEFAULT_URL as KODI_URL
 from kodi_client import Kodi, KodiError, kodi_name, utc_ts
 from ucapi import media_player as mp
@@ -39,6 +39,7 @@ EPG_RETRY_S = 15 * 60
 KODI_STORE = "https://play.google.com/store/apps/details?id=org.xbmc.kodi"
 KODI_APP, STORE_APP = "org.xbmc.kodi", "com.android.vending"
 ANDROID_LOG = "intg-androidtv"  # log service of the Remote's Android TV integration
+STREAM_START_S = 10  # a 4K channel silent for this long is replaced by its FHD version
 REPLAY_CHECK_S = 12  # after starting a replay, time to see whether the provider sent the programme or live TV
 OFF_STATES = ("OFF", "STANDBY", "UNAVAILABLE")
 
@@ -397,12 +398,22 @@ class Driver:
         return False
 
     async def open_item(self, item: dict) -> None:
-        """Player.Open; when nothing starts (Kodi behind another app is paused), bring Kodi to the front."""
+        """Player.Open; when nothing starts because Kodi is not on screen (paused behind another app),
+        bring Kodi to the front and open again. Kodi on screen: the stream itself does not start."""
         await self.kodi.call("Player.Open", {"item": item})
-        if not await self.wait_player(4):
+        if not await self.wait_player(4) and not await self.kodi_on_screen():
             await self.ensure_kodi(to_front=True)
             if not await self.wait_player(6):
                 await self.kodi.call("Player.Open", {"item": item})
+
+    async def wait_started(self, seconds: float) -> bool:
+        """The picture runs: a player with a time (a stream that does not answer leaves it at 0)."""
+        for _ in range(int(seconds)):
+            pl = await self.kodi.player()
+            if pl and pl["time"] > 0:
+                return True
+            await asyncio.sleep(1)
+        return False
 
     async def soon(self, action, *args) -> ucapi.StatusCodes:
         """Answer the Remote at once and play in the background: waking the Shield, opening Kodi and checking
@@ -438,14 +449,21 @@ class Driver:
     async def play_channel(self, cat_id: str, stream_id: int) -> ucapi.StatusCodes:
         if not await self.ensure_kodi():
             return ucapi.StatusCodes.SERVICE_UNAVAILABLE
-        cid = await self.kodi_channel(stream_id)
-        if cid is None:
-            _LOG.warning("Channel %s not found in Kodi", stream_id)
-            return ucapi.StatusCodes.NOT_FOUND
-        _LOG.info("Play channel %s (Kodi %s)", stream_id, cid)
-        await self.open_item({"channelid": cid})
         self.replay = None
         self.remember(cat_id, stream_id)
+        # a 4K channel that sends nothing (some only broadcast for events): its other versions, FHD first
+        found = self.catalog.find(stream_id)
+        fallback = [t["id"] for t in self.catalog.twins.get(stream_id, [])] if found and is_4k(found[1]["name"]) else []
+        for n, source in enumerate([stream_id, *fallback]):
+            cid = await self.kodi_channel(source)
+            if cid is None:
+                _LOG.warning("Channel %s not found in Kodi", source)
+                continue
+            _LOG.info("Play channel %s (Kodi %s)%s", source, cid, f" instead of {stream_id}" if n else "")
+            await self.open_item({"channelid": cid})
+            if not fallback or await self.wait_started(STREAM_START_S):
+                break
+            _LOG.warning("Channel %s does not start", source)
         await self.refresh()
         return ucapi.StatusCodes.OK
 
@@ -585,7 +603,8 @@ class Driver:
         cat, ch = self.catalog.by_id[found[0]], self.catalog.channel(*found)
         if self.current != found and (not self.current or self.current[1] != found[1]):
             self.remember(*found)  # zapped in Kodi itself: CH+/- and the next start follow
-        attrs[mp.Attributes.MEDIA_TITLE] = ch["name"]
+        name = item.get("channel") or ch["name"]  # the version really playing ("M6 FHD" for M6 4K)
+        attrs[mp.Attributes.MEDIA_TITLE] = name
         attrs[mp.Attributes.MEDIA_ARTIST] = cat["name"]
         attrs[mp.Attributes.MEDIA_IMAGE_URL] = ch.get("logo") or ""
         began = item_ts(item.get("starttime"))
@@ -597,10 +616,10 @@ class Driver:
             p = next((x for x in progs if abs(x["start"] - began) < 120), None)
             p = p or {"title": item.get("title") or "", "start": began, "stop": item_ts(item.get("endtime")) or began}
             when = f"{day_label(p['start'], now)}{hhmm(p['start'])}–{hhmm(p['stop'])}"
-            self.programme_attrs(attrs, ch, p, pl["time"], pl["total"], f"Replay · {when} · {ch['name']}", True)
+            self.programme_attrs(attrs, ch, p, pl["time"], pl["total"], f"Replay · {when} · {name}", True)
         elif live:  # "Plus belle la vie" / "14:00–14:25 · TF1 FHD" with the programme image and its progress
             self.programme_attrs(attrs, ch, live, int(now - live["start"]), live["stop"] - live["start"],
-                                 f"{hhmm(live['start'])}–{hhmm(live['stop'])} · {ch['name']}")
+                                 f"{hhmm(live['start'])}–{hhmm(live['stop'])} · {name}")
         else:
             self.programme_key = None
             attrs.update(no_progress)
