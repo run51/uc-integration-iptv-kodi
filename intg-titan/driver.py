@@ -136,7 +136,7 @@ class Driver:
         self.by_kodi_name: dict[str, tuple[str, int]] = {}
         self.catalog = Catalog({})
         self.current: tuple[str, int] | None = None  # (category id, stream id) last played
-        self.replay: dict | None = None  # {"stream", "start", "stop", "title"} of the replay started last
+        self.replay: dict | None = None  # {"stream" (source), "shown", "category", "start"} of the last replay
         self.check_task: asyncio.Task | None = None
         self.launch_lock = asyncio.Lock()
         self.background: asyncio.Task | None = None
@@ -158,6 +158,8 @@ class Driver:
         for cat in self.catalog.categories:
             for ch in cat["channels"]:
                 self.by_kodi_name.setdefault(kodi_name(ch["name"]), (cat["id"], ch["id"]))
+                for twin in self.catalog.twins.get(ch["id"], []):  # its replay is shown as the channel's
+                    self.by_kodi_name.setdefault(kodi_name(twin["name"]), (cat["id"], ch["id"]))
 
     def save_state(self) -> None:
         state = {"no_replay": sorted(self.no_replay)}
@@ -302,11 +304,19 @@ class Driver:
         return (await self.remote.entity(self.shield)).get("attributes") or {}
 
     async def bring_kodi(self) -> None:
+        """Play Store page of Kodi, then "Ouvrir" (focused). The page may take 8 s to show after a wake-up:
+        press again while Kodi does not answer (an extra press on the page or on Kodi's splash is harmless)."""
         _LOG.info("Opening Kodi (Play Store page, then Ouvrir)")
         await self.remote.command(self.shield, "media_player.select_source", {"source": KODI_STORE})
-        await asyncio.sleep(5)
-        await self.remote.command(self.shield, "media_player.cursor_enter")
-        self.kodi_front = True
+        await asyncio.sleep(7)
+        for _ in range(3):
+            await self.remote.command(self.shield, "media_player.cursor_enter")
+            for _ in range(10):
+                await asyncio.sleep(1)
+                if await self.kodi.alive():
+                    self.kodi_front = True
+                    return
+        _LOG.warning("Kodi did not open from its Play Store page")
 
     def watch_shield(self, a: dict) -> None:
         """Forget that Kodi is on screen once the Shield sleeps, dreams or shows another app.
@@ -368,10 +378,8 @@ class Driver:
         return ucapi.StatusCodes.OK
 
     async def kodi_channel(self, stream_id: int) -> int | None:
-        found = self.catalog.find(stream_id)
-        if not found:
-            return None
-        return await self.kodi.channel_id(found[1]["name"], self.catalog.number(stream_id))
+        name = self.catalog.names.get(stream_id)
+        return await self.kodi.channel_id(name, self.catalog.number(stream_id)) if name else None
 
     async def open_kodi(self) -> ucapi.StatusCodes:
         return ucapi.StatusCodes.OK if await self.ensure_kodi() else ucapi.StatusCodes.SERVICE_UNAVAILABLE
@@ -395,42 +403,51 @@ class Driver:
         return ucapi.StatusCodes.OK
 
     async def play_replay(self, cat_id: str, stream_id: int, start: int) -> ucapi.StatusCodes:
-        prog = next((p for p in (self.guide.programmes(stream_id) if self.guide else []) if p["start"] == start), None)
+        """Replay of a programme, from the channel itself or one of its other versions (the FHD of a 4K
+        channel), whichever is not known to lack the replay."""
+        sources = self.catalog.replay_sources(stream_id)
+        if not sources:
+            return ucapi.StatusCodes.NOT_FOUND
+        source = sources[0]
         if not await self.ensure_kodi():
             return ucapi.StatusCodes.SERVICE_UNAVAILABLE
-        cid = await self.kodi_channel(stream_id)
+        cid = await self.kodi_channel(source)
         bid = await self.kodi.broadcast_id(cid, start) if cid is not None else None
         if bid is None:
-            _LOG.warning("Programme %s of channel %s not found in Kodi", start, stream_id)
+            _LOG.warning("Programme %s of channel %s not found in Kodi", start, source)
             return ucapi.StatusCodes.NOT_FOUND
-        _LOG.info("Play replay %s at %s (Kodi broadcast %s)", stream_id, start, bid)
-        await self.open_item({"broadcastid": bid})
-        self.replay = {"stream": stream_id, "start": start, "stop": prog["stop"] if prog else start,
-                       "title": prog["title"] if prog else ""}
+        _LOG.info("Play replay of %s at %s from channel %s (Kodi broadcast %s)", stream_id, start, source, bid)
+        self.replay = {"stream": source, "shown": stream_id, "category": cat_id, "start": start}
         self.remember(cat_id, stream_id)
-        if self.check_task and not self.check_task.done():
-            self.check_task.cancel()
-        self.check_task = asyncio.create_task(self.check_replay(stream_id, start))
+        await self.open_item({"broadcastid": bid})
+        if self.check_task and not self.check_task.done() and self.check_task is not asyncio.current_task():
+            self.check_task.cancel()  # (a retry runs inside the check task itself: do not cancel it)
+        self.check_task = asyncio.create_task(self.check_replay(dict(self.replay)))
         await self.refresh()
         return ucapi.StatusCodes.OK
 
-    async def check_replay(self, stream_id: int, start: int) -> None:
-        """Providers send live TV for a channel without catch-up: then hide its "Déjà diffusé" row from now on."""
+    async def check_replay(self, asked: dict) -> None:
+        """Providers send live TV for a channel without catch-up: remember it, try the next version of the
+        channel, and hide the "Déjà diffusé" row once none is left."""
         await asyncio.sleep(REPLAY_CHECK_S)
         try:
             pl = await self.kodi.player()
         except KodiError:
             return
-        if not pl or not self.replay or self.replay.get("stream") != stream_id:
+        if not pl or self.replay != asked:
             return
         began = item_ts(pl["item"].get("starttime"))
-        if began is not None and abs(began - start) > 300:
-            _LOG.info("Channel %s has no replay (Kodi plays the programme of %s)", stream_id,
-                      pl["item"].get("starttime"))
-            self.no_replay.add(stream_id)
-            self.replay = None
-            self.save_state()
-            self.rebuild()
+        if began is None or abs(began - asked["start"]) <= 300:
+            return
+        _LOG.info("Channel %s has no replay (Kodi plays the programme of %s)", asked["stream"],
+                  pl["item"].get("starttime"))
+        self.no_replay.add(asked["stream"])
+        self.replay = None
+        self.save_state()
+        self.rebuild()
+        if self.catalog.replay_sources(asked["shown"]):
+            await self.play_replay(asked["category"], asked["shown"], asked["start"])
+        else:
             await self.refresh()
 
     async def on_command(self, entity, cmd_id: str, params: dict | None, websocket=None):

@@ -13,8 +13,11 @@ Media ids:
   rp:<cat>:<stream>:<start>    one of them: played in Kodi from the provider's catch-up
 """
 
+import re
 import time
 import unicodedata
+
+from epg import base_name
 
 from ucapi.media_player import BrowseMediaItem, MediaClass, MediaContentType
 
@@ -58,21 +61,74 @@ def fold(text: str) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
+UHD = re.compile(r"\b(4k|uhd)\b", re.I)
+MAX_TWINS = 2
+
+
+def is_4k(name: str) -> bool:
+    return bool(UHD.search(name or ""))
+
+
+def twin_rank(name: str) -> int:
+    """Which other version of a channel to try first for its replay: FHD, then HD, then the rest."""
+    up = (name or "").upper()
+    return 0 if "FHD" in up else 1 if re.search(r"\bHD\b", up) else 2
+
+
 def apply_filter(data: dict, hidden: dict | None) -> dict:
     """Catalog without the categories and channels hidden on the settings page.
 
-    hidden = {"categories": ["7", ...], "channels": {"3": [1151, ...]}}
+    hidden = {"categories": ["7", ...], "channels": {"3": [1151, ...]}, "prefer_4k": true}
+    prefer_4k (default on): in a category, a channel shown in 4K hides its other versions (same name
+    without the quality words: "TF1 4K HDR UHD" hides "TF1 FHD").
     """
     hidden = hidden or {}
     cats = set(hidden.get("categories") or [])
     chans = {k: set(v) for k, v in (hidden.get("channels") or {}).items()}
+    prefer_4k = hidden.get("prefer_4k", True)
     out = []
     for cat in data.get("categories", []):
         if cat["id"] in cats:
             continue
         drop = chans.get(cat["id"], set())
-        out.append({**cat, "channels": [ch for ch in cat["channels"] if ch["id"] not in drop]})
+        kept = [ch for ch in cat["channels"] if ch["id"] not in drop]
+        if prefer_4k:
+            uhd = {base_name(ch["name"]) for ch in kept if is_4k(ch["name"])}
+            kept = [ch for ch in kept if is_4k(ch["name"]) or base_name(ch["name"]) not in uhd]
+        out.append({**cat, "channels": kept})
     return {"categories": out}
+
+
+def replay_twins(data: dict, categories: list[dict]) -> dict[int, list[dict]]:
+    """Hidden versions of each channel shown (same category, same name without the quality words), the
+    FHD first: the provider has the replay of "TF1 FHD" but not of "TF1 4K"."""
+    shown = {ch["id"] for cat in categories for ch in cat["channels"]}
+    raw = {cat["id"]: cat["channels"] for cat in data.get("categories", [])}
+    twins: dict[int, list[dict]] = {}
+    for cat in categories:
+        by_key: dict[str, list[dict]] = {}
+        for ch in raw.get(cat["id"], []):
+            if ch["id"] not in shown:
+                by_key.setdefault(base_name(ch["name"]), []).append(ch)
+        for ch in cat["channels"]:
+            others = sorted(by_key.get(base_name(ch["name"]), []), key=lambda c: twin_rank(c["name"]))
+            if others:
+                twins[ch["id"]] = others[:MAX_TWINS]
+    return twins
+
+
+def kodi_lineup(data: dict, hidden: dict | None) -> list[tuple[str, dict]]:
+    """(group, channel) in the order of the Kodi playlist: the channels shown, then their hidden versions
+    kept for the replay. Kodi numbers them from 1 in this order."""
+    cats = [c for c in apply_filter(data, hidden)["categories"] if c.get("channels")]
+    out = [(cat["name"], ch) for cat in cats for ch in cat["channels"]]
+    seen = {ch["id"] for _, ch in out}
+    for twins in replay_twins(data, cats).values():
+        for ch in twins:
+            if ch["id"] not in seen:
+                seen.add(ch["id"])
+                out.append(("Replay (autres versions)", ch))
+    return out
 
 
 class Catalog:
@@ -81,16 +137,22 @@ class Catalog:
         self.by_id = {c["id"]: c for c in self.categories}
         self.guide = guide  # epg.Guide or None
         self.no_replay = no_replay if no_replay is not None else set()  # channels seen without catch-up
+        self.twins = replay_twins(data, self.categories)
+        self.lineup = kodi_lineup(data, hidden)
+        self.numbers = {ch["id"]: n for n, (_, ch) in enumerate(self.lineup, 1)}
+        self.names = {ch["id"]: ch["name"] for _, ch in self.lineup}
 
     def number(self, stream_id: int) -> int | None:
-        """Channel number in Kodi: the feed numbers the visible channels in the catalog order from 1."""
-        n = 0
-        for cat in self.categories:
-            for ch in cat["channels"]:
-                n += 1
-                if ch["id"] == stream_id:
-                    return n
-        return None
+        """Channel number in Kodi (order of the playlist made by tools/kodi_feed.py)."""
+        return self.numbers.get(stream_id)
+
+    def replay_sources(self, stream_id: int) -> list[int]:
+        """Channels to try for the replay of a channel, those known without replay left out: a 4K channel
+        through its other versions first (providers seldom record 4K), else the channel itself first."""
+        twins = [t["id"] for t in self.twins.get(stream_id, [])]
+        own = self.names.get(stream_id, "")
+        order = twins + [stream_id] if is_4k(own) else [stream_id] + twins
+        return [s for s in order if s not in self.no_replay]
 
     def find(self, stream_id: int) -> tuple[dict, dict] | None:
         """(category, channel) of a stream id (the first category holding it)."""
@@ -137,7 +199,7 @@ class Catalog:
         return None
 
     def has_replay(self, stream_id: int) -> bool:
-        return bool(self.guide and stream_id not in self.no_replay and self.guide.past(stream_id, 1))
+        return bool(self.guide and self.replay_sources(stream_id) and self.guide.past(stream_id, 1))
 
     def channel_item(
         self, cat: dict, ch: dict, with_category: bool = False, subtitle: str | None = None, guide_mode: bool = False

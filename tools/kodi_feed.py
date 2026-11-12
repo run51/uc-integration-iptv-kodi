@@ -2,7 +2,8 @@
 
 Serves two files over HTTP, rebuilt when the channel choice changes and every 6 hours:
   /kodi.m3u     the channels left visible on the settings page, in the catalog order, numbered, with the guide id
-                (tvg-id) of the public guide and Xtream catch-up enabled (catchup="xc");
+                (tvg-id) of the public guide and Xtream catch-up enabled (catchup="xc"), then the hidden
+                versions of these channels (FHD of a 4K channel) kept for the replay, in their own group;
   /epg.xml.gz   the public XMLTV guide (xmltvfr.fr) reduced to these channels, past programmes included.
 
 The stream addresses carry the provider credentials: they are read from a private file (never logged) and the
@@ -29,7 +30,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import epg
-from catalog import apply_filter
+from catalog import kodi_lineup
 
 _LOG = logging.getLogger("kodi_feed")
 REFRESH_S = 6 * 3600
@@ -40,19 +41,16 @@ def esc(text: str) -> str:
     return (text or "").replace('"', "'").replace("\n", " ").strip()
 
 
-def build_m3u(categories: list[dict], ids: dict[int, str], stream_base: str, epg_url: str = "") -> str:
+def build_m3u(lineup: list[tuple[str, dict]], ids: dict[int, str], stream_base: str, epg_url: str = "") -> str:
     head = f'#EXTM3U x-tvg-url="{epg_url}"' if epg_url else "#EXTM3U"
     lines = [head]
-    number = 0
-    for cat in categories:
-        for ch in cat["channels"]:
-            number += 1
-            lines.append(
-                f'#EXTINF:-1 tvg-id="{esc(ids.get(ch["id"], ""))}" tvg-name="{esc(ch["name"])}" '
-                f'tvg-logo="{esc(ch.get("logo", ""))}" tvg-chno="{number}" group-title="{esc(cat["name"])}" '
-                f'catchup="xc" catchup-days="{CATCHUP_DAYS}",{esc(ch["name"])}'
-            )
-            lines.append(f"{stream_base.rstrip('/')}/{ch['id']}")
+    for number, (group, ch) in enumerate(lineup, 1):
+        lines.append(
+            f'#EXTINF:-1 tvg-id="{esc(ids.get(ch["id"], ""))}" tvg-name="{esc(ch["name"])}" '
+            f'tvg-logo="{esc(ch.get("logo", ""))}" tvg-chno="{number}" group-title="{esc(group)}" '
+            f'catchup="xc" catchup-days="{CATCHUP_DAYS}",{esc(ch["name"])}'
+        )
+        lines.append(f"{stream_base.rstrip('/')}/{ch['id']}")
     return "\n".join(lines) + "\n"
 
 
@@ -116,11 +114,11 @@ class Feed:
         if os.path.exists(self.args.hidden):
             with open(self.args.hidden, encoding="utf-8") as file:
                 hidden = json.load(file)
-        cats = [c for c in apply_filter(data, hidden)["categories"] if c.get("channels")]
-        channels = [ch for c in cats for ch in c["channels"]]
+        lineup = kodi_lineup(data, hidden)
+        channels = [ch for _, ch in lineup]
         raw = self._guide_raw()
         ids = epg.match_ids(channels, epg.parse(raw, set())[0]) if raw else {}
-        m3u = build_m3u(cats, ids, self.stream_base, self.args.epg_url).encode()
+        m3u = build_m3u(lineup, ids, self.stream_base, self.args.epg_url).encode()
         guide = reduce_guide(raw, set(ids.values())) if raw else self.guide
         with self.lock:
             self.m3u, self.guide = m3u, guide

@@ -10,11 +10,14 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from catalog import is_4k
+from epg import base_name
+
 _LOG = logging.getLogger("titan.settings")
 
 PAGE = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Titan Player — chaînes</title>
+<title>IPTV — chaînes</title>
 <style>
 :root{--bg:#0f1115;--panel:#181b22;--line:#2a2f3a;--fg:#e8eaf0;--mute:#9aa3b2;--accent:#4da6ff;--off:#5b6270}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -33,21 +36,26 @@ main{padding:12px max(16px,env(safe-area-inset-left)) 40px;max-width:1100px;marg
 .ch span{overflow-wrap:anywhere;font-size:14px;line-height:1.3}
 input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);flex:none}
 .chev{color:var(--mute);width:16px}
+.opt{display:flex;gap:8px;align-items:center;margin-top:8px;color:var(--mute);font-size:14px;cursor:pointer}
+.ch.auto{opacity:.4}.ch .why{display:block;color:var(--mute);font-size:12px}
 </style></head><body>
-<header><h1>Titan Player — chaînes affichées sur la remote</h1>
+<header><h1>IPTV — chaînes affichées sur la remote et dans Kodi</h1>
 <div class="row"><input type="search" id="q" placeholder="Rechercher une chaîne ou une catégorie…">
-<span class="stat" id="stat"></span><span class="saved" id="saved"></span></div></header>
+<span class="stat" id="stat"></span><span class="saved" id="saved"></span></div>
+<label class="opt"><input type="checkbox" id="p4k"> Garder seulement la version 4K d'une chaîne quand elle existe (les autres versions servent encore au replay)</label></header>
 <main id="list"></main>
 <script>
-let cat=[],hidden={categories:[],channels:{}},open=new Set(),timer=null;
+let cat=[],hidden={categories:[],channels:{},prefer_4k:true},open=new Set(),timer=null;
 const $=s=>document.querySelector(s);
 const fold=t=>(t||"").normalize("NFD").replace(/[̀-ͯ]/g,"").toLowerCase();
 function isCatHidden(id){return hidden.categories.includes(id)}
 function isChHidden(c,id){return (hidden.channels[c]||[]).includes(id)}
+function autoHidden(c,h){if(!hidden.prefer_4k||h.uhd)return false;  // another version of the channel is shown in 4K
+ return c.channels.some(x=>x.uhd&&x.key===h.key&&!isChHidden(c.id,x.id))}
 function save(){$("#saved").textContent="…";clearTimeout(timer);timer=setTimeout(async()=>{
  const r=await fetch("api/hidden",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(hidden)});
  $("#saved").textContent=r.ok?"Enregistré ✓":"Erreur";stat()},400)}
-function stat(){let shown=0,tot=0;for(const c of cat){tot+=c.channels.length;if(!isCatHidden(c.id))shown+=c.channels.filter(h=>!isChHidden(c.id,h.id)).length}
+function stat(){let shown=0,tot=0;for(const c of cat){tot+=c.channels.length;if(!isCatHidden(c.id))shown+=c.channels.filter(h=>!isChHidden(c.id,h.id)&&!autoHidden(c,h)).length}
  $("#stat").textContent=`${cat.length-hidden.categories.length}/${cat.length} catégories · ${shown}/${tot} chaînes affichées`}
 function setCh(c,id,show){const l=new Set(hidden.channels[c]||[]);show?l.delete(id):l.add(id);hidden.channels[c]=[...l];if(!hidden.channels[c].length)delete hidden.channels[c]}
 function render(){const q=fold($("#q").value);const L=$("#list");L.innerHTML="";
@@ -63,15 +71,16 @@ function render(){const q=fold($("#q").value);const L=$("#list");L.innerHTML="";
    t.innerHTML='<button>Tout cocher</button><button>Tout décocher</button>';
    const [a,b]=t.querySelectorAll("button");a.onclick=()=>{for(const h of chs)setCh(c.id,h.id,true);save();render()};b.onclick=()=>{for(const h of chs)setCh(c.id,h.id,false);save();render()};
    d.appendChild(t);const g=document.createElement("div");g.className="grid";
-   for(const h of chs){const off=isChHidden(c.id,h.id);const e=document.createElement("label");e.className="ch"+(off?" off":"");
+   for(const h of chs){const off=isChHidden(c.id,h.id);const auto=!off&&autoHidden(c,h);const e=document.createElement("label");e.className="ch"+(off?" off":"")+(auto?" auto":"");
     e.innerHTML=`<input type="checkbox" ${off?"":"checked"}><img loading="lazy" alt=""><span></span>`;
-    e.querySelector("span").textContent=h.name;e.title=h.name;if(h.logo)e.querySelector("img").src=h.logo;else e.querySelector("img").style.visibility="hidden";
+    e.querySelector("span").textContent=h.name;if(auto){const w=document.createElement("small");w.className="why";w.textContent="Masquée : version 4K affichée";e.querySelector("span").appendChild(w)}e.title=h.name;if(h.logo)e.querySelector("img").src=h.logo;else e.querySelector("img").style.visibility="hidden";
     e.querySelector("input").onchange=ev=>{setCh(c.id,h.id,ev.target.checked);e.classList.toggle("off",!ev.target.checked);save();
      d.querySelector(".count").textContent=c.channels.filter(x=>!isChHidden(c.id,x.id)).length+"/"+c.channels.length};
     g.appendChild(e)}d.appendChild(g)}
   L.appendChild(d)}stat()}
 $("#q").oninput=render;
-fetch("api/catalog").then(r=>r.json()).then(j=>{cat=j.catalog.categories;hidden=Object.assign({categories:[],channels:{}},j.hidden);render()});
+$("#p4k").onchange=e=>{hidden.prefer_4k=e.target.checked;save();render()};
+fetch("api/catalog").then(r=>r.json()).then(j=>{cat=j.catalog.categories;hidden=Object.assign({categories:[],channels:{},prefer_4k:true},j.hidden);$("#p4k").checked=hidden.prefer_4k!==false;render()});
 </script></body></html>"""
 
 
@@ -94,7 +103,11 @@ def start(port: int, get_catalog, get_hidden, save_hidden) -> ThreadingHTTPServe
             if self.path in ("/", "/index.html"):
                 self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             elif self.path == "/api/catalog":
-                body = json.dumps({"catalog": get_catalog(), "hidden": get_hidden()}, ensure_ascii=False)
+                catalog = {"categories": [
+                    {**cat, "channels": [{**ch, "key": base_name(ch["name"]), "uhd": is_4k(ch["name"])}
+                                         for ch in cat["channels"]]}
+                    for cat in (get_catalog() or {}).get("categories", [])]}
+                body = json.dumps({"catalog": catalog, "hidden": get_hidden()}, ensure_ascii=False)
                 self._send(200, body.encode(), "application/json")
             else:
                 self._send(404, b"not found", "text/plain")
@@ -109,6 +122,7 @@ def start(port: int, get_catalog, get_hidden, save_hidden) -> ThreadingHTTPServe
                 hidden = {
                     "categories": [str(c) for c in data.get("categories", [])],
                     "channels": {str(k): [int(x) for x in v] for k, v in (data.get("channels") or {}).items()},
+                    "prefer_4k": bool(data.get("prefer_4k", True)),
                 }
             except (ValueError, TypeError, AttributeError):
                 self._send(400, b"bad request", "text/plain")
