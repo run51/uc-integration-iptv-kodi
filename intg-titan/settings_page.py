@@ -7,6 +7,7 @@ POST /api/m3u imports the provider's M3U playlist (body = the file). GET /kodi.m
 playlist and guide for Kodi, only to the allowed addresses (the stream addresses carry the provider login).
 """
 
+import email.utils
 import json
 import logging
 import os
@@ -102,15 +103,17 @@ def start(port: int, get_catalog, get_hidden, save_hidden, import_m3u=None, feed
           playlist=None) -> ThreadingHTTPServer:
     """Serve the settings page in a background thread.
 
-    import_m3u(path) -> {"channels": n} | raises ValueError; feed(path) -> (bytes, content type) | None;
+    import_m3u(path) -> {"channels": n} | raises ValueError; feed(path) -> (bytes, content type[, mtime]) | None;
     allowed(ip) -> bool for the Kodi files; playlist() -> {"channels", "imported"}."""
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        def _send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
             self.send_response(code)
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
@@ -127,8 +130,21 @@ def start(port: int, get_catalog, get_hidden, save_hidden, import_m3u=None, feed
                 found = feed(path)
                 if found is None:
                     self._send(503, b"not ready", "text/plain")
-                else:
-                    self._send(200, found[0], found[1])
+                    return
+                body, ctype, *mtime = found
+                if mtime:  # the guide (8 MB) is sent again only when it changed
+                    since = self.headers.get("If-Modified-Since")
+                    try:
+                        unchanged = since and email.utils.parsedate_to_datetime(since).timestamp() >= int(mtime[0])
+                    except (TypeError, ValueError):
+                        unchanged = False
+                    if unchanged:
+                        self.send_response(304)
+                        self.end_headers()
+                        return
+                    self._send(200, body, ctype, {"Last-Modified": email.utils.formatdate(mtime[0], usegmt=True)})
+                    return
+                self._send(200, body, ctype)
                 return
             if self.path in ("/", "/index.html"):
                 self._send(200, PAGE.encode(), "text/html; charset=utf-8")

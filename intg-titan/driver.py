@@ -28,7 +28,7 @@ import feed
 import m3u
 import settings_page
 import ucapi
-from catalog import Catalog, day_label, hhmm, is_4k
+from catalog import LOCAL_TZ, Catalog, day_label, hhmm, is_4k
 from kodi_client import DEFAULT_URL as KODI_URL
 from kodi_client import Kodi, KodiError, kodi_name, utc_ts
 from kodi_guide import KodiGuide
@@ -40,8 +40,9 @@ ENTITY_ID = "titan_player"  # kept from the Titan Player versions: activities an
 DEFAULT_SHIELD = "uc_androidtv_driver.main.48B02D36F2DF"
 DEFAULT_LIMIT, MAX_LIMIT = 50, 100
 POLL_S = 5
-EPG_REFRESH_S = 6 * 3600
-EPG_RETRY_S = 15 * 60
+GUIDE_CHECK_S = 30 * 60
+GUIDE_NIGHT = (3, 6)  # the public guide is updated once a day: downloaded at night (local hours)
+GUIDE_MAX_AGE_S = 36 * 3600  # older than that (the Remote slept all night): downloaded at once
 KODI_STORE = "https://play.google.com/store/apps/details?id=org.xbmc.kodi"
 KODI_APP, STORE_APP = "org.xbmc.kodi", "com.android.vending"
 ANDROID_LOG = "intg-androidtv"  # log service of the Remote's Android TV integration
@@ -290,17 +291,26 @@ class Driver:
         except KodiError as ex:
             _LOG.debug("Programmes not available from Kodi: %s", ex)
 
+    def guide_due(self) -> bool:
+        """Download the guide once a night (8 MB); at once when missing or older than a day and a half."""
+        path = self.path("epg.xml.gz")
+        if not os.path.exists(path):
+            return True
+        age = time.time() - os.path.getmtime(path)
+        hour = datetime.now(LOCAL_TZ).hour
+        return age > GUIDE_MAX_AGE_S or (age > 12 * 3600 and GUIDE_NIGHT[0] <= hour < GUIDE_NIGHT[1])
+
     async def guide_loop(self) -> None:
-        await self.load_guide(download=False)  # cached copy first: browsing has the guide at once
+        await self.load_guide(download=False)  # copy kept first: the channel ids at once
         while True:
             try:
-                await self.load_guide()
-                await asyncio.sleep(EPG_REFRESH_S)
+                if self.guide_due():
+                    await self.load_guide()
             except asyncio.CancelledError:
                 raise
             except Exception as ex:  # noqa: BLE001 - keep the loop alive
                 _LOG.warning("Guide refresh failed: %s", ex)
-                await asyncio.sleep(EPG_RETRY_S)
+            await asyncio.sleep(GUIDE_CHECK_S)
 
     # ------------------------------------------------------- playlist and Kodi feed
     def import_m3u(self, path: str) -> dict:
@@ -340,7 +350,7 @@ class Driver:
         if path == "/epg.xml.gz":  # the whole public guide: Kodi reads the programmes itself
             try:
                 with open(self.path("epg.xml.gz"), "rb") as file:
-                    return file.read(), "application/gzip"
+                    return file.read(), "application/gzip", os.path.getmtime(self.path("epg.xml.gz"))
             except OSError:
                 return None
         if not self.stream_base or not self.catalog.lineup:
