@@ -10,13 +10,38 @@ Media ids:
   ch:<cat>:<stream>  a channel (played with the iptvtitan://channel/<account>/<stream> link)
 """
 
+import time
 import unicodedata
 
 from ucapi.media_player import BrowseMediaItem, MediaClass, MediaContentType
 
+try:
+    from zoneinfo import ZoneInfo
+
+    LOCAL_TZ = ZoneInfo("Europe/Paris")
+except Exception:  # noqa: BLE001 - no tz database: fall back to the system local time
+    LOCAL_TZ = None
+
 ROOT = "root"
 CATEGORY_ICON = "icon://uc:list"
 CHANNEL_ICON = "icon://uc:tv"
+
+
+def hhmm(ts: float) -> str:
+    from datetime import datetime
+
+    if LOCAL_TZ:
+        return datetime.fromtimestamp(ts, LOCAL_TZ).strftime("%H:%M")
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def day_label(ts: float, now: float | None = None) -> str:
+    """"" today, "demain " tomorrow (programme lists span ~36 h)."""
+    from datetime import datetime
+
+    now = now or time.time()
+    d = datetime.fromtimestamp(ts, LOCAL_TZ).date()
+    return "" if d == datetime.fromtimestamp(now, LOCAL_TZ).date() else "demain "
 
 
 def fold(text: str) -> str:
@@ -43,9 +68,18 @@ def apply_filter(data: dict, hidden: dict | None) -> dict:
 
 
 class Catalog:
-    def __init__(self, data: dict, hidden: dict | None = None):
+    def __init__(self, data: dict, hidden: dict | None = None, guide=None):
         self.categories = [c for c in apply_filter(data, hidden)["categories"] if c.get("channels")]
         self.by_id = {c["id"]: c for c in self.categories}
+        self.guide = guide  # epg.Guide or None
+
+    def channels(self) -> list[dict]:
+        return [ch for c in self.categories for ch in c["channels"]]
+
+    def now_line(self, stream_id: int) -> str | None:
+        """"14:00 Plus belle la vie" for the programme on air, None without guide."""
+        p = self.guide.now(stream_id) if self.guide else None
+        return f"{hhmm(p['start'])} {p['title']}" if p else None
 
     def channel(self, cat_id: str, stream_id: int) -> dict | None:
         for ch in self.by_id.get(cat_id, {}).get("channels", []):
@@ -68,16 +102,40 @@ class Catalog:
             return parts[1], int(parts[2])
         return None
 
-    def channel_item(self, cat: dict, ch: dict, with_category: bool = False) -> BrowseMediaItem:
+    def channel_item(
+        self, cat: dict, ch: dict, with_category: bool = False, subtitle: str | None = None
+    ) -> BrowseMediaItem:
+        """A channel row: tap = its programme page (when the guide knows it), the play icon = watch it."""
+        line = subtitle or self.now_line(ch["id"]) or (cat["name"] if with_category else None)
+        has_guide = bool(self.guide and self.guide.programmes(ch["id"]))
         return BrowseMediaItem(
             media_id=f"ch:{cat['id']}:{ch['id']}",
             title=ch["name"],
-            subtitle=cat["name"] if with_category else None,
+            subtitle=line,
+            artist=line,
             media_class=MediaClass.CHANNEL,
             media_type=MediaContentType.CHANNEL,
             can_play=True,
+            can_browse=has_guide,
             thumbnail=ch.get("logo") or CHANNEL_ICON,
         )
+
+    def programme_items(self, cat: dict, ch: dict) -> list[BrowseMediaItem]:
+        items = []
+        now = time.time()
+        for p in self.guide.upcoming(ch["id"]) if self.guide else []:
+            when = f"{day_label(p['start'], now)}{hhmm(p['start'])}–{hhmm(p['stop'])}"
+            on_air = p["start"] <= now < p["stop"]
+            items.append(BrowseMediaItem(
+                media_id=f"ch:{cat['id']}:{ch['id']}",  # playing a programme row plays the channel
+                title=p["title"] + (f" – {p['sub']}" if p.get("sub") else ""),
+                subtitle=("En cours · " if on_air else "") + when + (f" · {p['cat']}" if p.get("cat") else ""),
+                media_class=MediaClass.VIDEO,
+                media_type=MediaContentType.VIDEO,
+                can_play=on_air,
+                thumbnail=p.get("icon") or ch.get("logo") or CHANNEL_ICON,
+            ))
+        return items
 
     def category_item(self, cat: dict) -> BrowseMediaItem:
         return BrowseMediaItem(
@@ -104,6 +162,21 @@ class Catalog:
             cat = self.by_id[media_id[4:]]
             container = self.category_item(cat)
             return container, [self.channel_item(cat, ch) for ch in cat["channels"]]
+        parsed = self.parse_channel_id(media_id)
+        if parsed and self.channel(*parsed):
+            cat, ch = self.by_id[parsed[0]], self.channel(*parsed)
+            p = self.guide.now(ch["id"]) if self.guide else None
+            container = BrowseMediaItem(  # programme page: cover = logo, info line = programme on air, Play = watch
+                media_id=media_id,
+                title=ch["name"],
+                artist=f"En cours : {p['title']}" if p else cat["name"],
+                media_class=MediaClass.CHANNEL,
+                media_type=MediaContentType.CHANNEL,
+                can_browse=True,
+                can_play=True,
+                thumbnail=ch.get("logo") or CHANNEL_ICON,
+            )
+            return container, self.programme_items(cat, ch)
         raise KeyError(media_id)
 
     def search(self, query: str, limit: int = 200) -> list[BrowseMediaItem]:
@@ -118,4 +191,18 @@ class Catalog:
                 if needle in name:
                     found.append((len(name), cat, ch))
         found.sort(key=lambda t: t[0])
-        return [self.channel_item(cat, ch, with_category=True) for _, cat, ch in found[:limit]]
+        items = [self.channel_item(cat, ch, with_category=True) for _, cat, ch in found[:limit]]
+        if self.guide:  # then the channels airing a matching programme now or within 24 h
+            seen = {i.media_id for i in items}
+            where = {ch["id"]: cat for cat in self.categories for ch in cat["channels"]}
+            now = time.time()
+            for sid, p in self.guide.search(query):
+                cat = where.get(sid)
+                ch = self.channel(cat["id"], sid) if cat else None
+                if not ch or f"ch:{cat['id']}:{sid}" in seen:
+                    continue
+                when = "En cours" if p["start"] <= now else f"{day_label(p['start'], now)}{hhmm(p['start'])}"
+                items.append(self.channel_item(cat, ch, subtitle=f"{when} · {p['title']}"))
+                if len(items) >= limit:
+                    break
+        return items

@@ -32,11 +32,13 @@ def parse(text: str) -> dict:
             if name and not SEPARATOR.search(name):
                 group = re.search(r'group-title="([^"]*)"', info)
                 logo = re.search(r'tvg-logo="([^"]*)"', info)
+                epg = re.search(r'tvg-id="([^"]*)"', info)
                 categories.setdefault((group.group(1).strip() if group else "") or "Autres", []).append(
                     {
                         "id": int(match.group(1)),
                         "name": PREFIX.sub("", name).strip() or name,
                         "logo": logo.group(1).strip() if logo and logo.group(1).startswith("http") else "",
+                        "epg": epg.group(1).strip() if epg else "",
                     }
                 )
         info = None

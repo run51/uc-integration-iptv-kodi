@@ -9,15 +9,20 @@ playlist by tools/build_catalog.py and read from catalog.json (config directory,
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
+import epg
 import settings_page
 import ucapi
-from catalog import Catalog
+from catalog import Catalog, hhmm
 from ucapi import media_player as mp
 
 _LOG = logging.getLogger("titan")
@@ -25,6 +30,8 @@ ENTITY_ID = "titan_player"
 DEFAULT_SHIELD = "uc_androidtv_driver.main.48B02D36F2DF"
 DEFAULT_LIMIT, MAX_LIMIT = 50, 100
 POLL_S = 5
+EPG_REFRESH_S = 6 * 3600
+EPG_RETRY_S = 15 * 60
 TITAN_APP = "titan"  # the Android TV player names the open app "Titan Player - IPTV"
 
 FEATURES = [
@@ -39,6 +46,8 @@ FEATURES = [
     mp.Features.MEDIA_ARTIST,
     mp.Features.MEDIA_IMAGE_URL,
     mp.Features.MEDIA_TYPE,
+    mp.Features.MEDIA_DURATION,
+    mp.Features.MEDIA_POSITION,
     mp.Features.PLAY_MEDIA,
     mp.Features.BROWSE_MEDIA,
     mp.Features.SEARCH_MEDIA,
@@ -57,13 +66,18 @@ class RemoteApi:
     """Minimal client of the Remote's Core REST API (API key)."""
 
     def __init__(self, base_url: str, api_key: str):
-        self.base = base_url.rstrip("/")
-        self.key = api_key
+        url = urllib.parse.urlsplit(base_url.rstrip("/"))
+        self.auth = "Bearer " + api_key
+        if url.username:  # "http://user:password@host" (e.g. the core simulator): basic authentication
+            cred = f"{urllib.parse.unquote(url.username)}:{urllib.parse.unquote(url.password or '')}"
+            self.auth = "Basic " + base64.b64encode(cred.encode()).decode()
+            url = url._replace(netloc=url.hostname + (f":{url.port}" if url.port else ""))
+        self.base = urllib.parse.urlunsplit(url)
 
     def _call(self, method: str, path: str, body: dict | None = None):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method, headers={
-            "Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
+            "Authorization": self.auth, "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read() or b"null")
 
@@ -114,13 +128,64 @@ class Driver:
         self.raw_catalog: dict = {}
         self.hidden: dict = {}
         self.settings_server = None
+        self.guide: epg.Guide | None = None
+        self.epg_task: asyncio.Task | None = None
+        self.programme_key = None  # (stream, start) of the programme whose position was last sent
+
+    def rebuild(self) -> None:
+        self.catalog = Catalog(self.raw_catalog, self.hidden, self.guide)
+
+    async def load_guide(self, download: bool = True) -> None:
+        """Download the public guide (or read the cached copy) and keep the programmes of the catalog."""
+        raw = None
+        if download:
+            for url in epg.SOURCES:
+                try:
+                    raw = await asyncio.to_thread(
+                        lambda u=url: urllib.request.urlopen(urllib.request.Request(u, headers={
+                            "User-Agent": "uc-intg-titan-player"}), timeout=120).read())
+                    with open(self.path("epg.xml.gz"), "wb") as file:
+                        file.write(raw)
+                    break
+                except (OSError, ValueError, urllib.error.URLError) as ex:
+                    _LOG.warning("Guide download %s failed: %s", url, ex)
+        if raw is None:
+            try:
+                with open(self.path("epg.xml.gz"), "rb") as file:
+                    raw = file.read()
+            except OSError:
+                return
+        channels = Catalog(self.raw_catalog).channels()
+
+        def work():
+            names, _ = epg.parse(raw, set())
+            ids = epg.match_ids(channels, names)
+            _, progs = epg.parse(raw, set(ids.values()))
+            return epg.Guide(progs, ids)
+
+        self.guide = await asyncio.to_thread(work)
+        self.rebuild()
+        count = sum(len(v) for v in self.guide.progs.values())
+        _LOG.info("Guide: %d channels, %d programmes", len(self.guide.ids), count)
+
+    async def guide_loop(self) -> None:
+        await self.load_guide(download=False)  # cached copy first: browsing has the guide at once
+        while True:
+            try:
+                await self.load_guide()
+                await asyncio.sleep(EPG_REFRESH_S)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - keep the loop alive
+                _LOG.warning("Guide refresh failed: %s", ex)
+                await asyncio.sleep(EPG_RETRY_S)
 
     def save_hidden(self, hidden: dict) -> None:
         """Called from the settings page thread: store the hidden lists and rebuild the browsed catalog."""
         with open(self.path("hidden.json"), "w", encoding="utf-8") as file:
             json.dump(hidden, file)
         self.hidden = hidden
-        self.catalog = Catalog(self.raw_catalog, hidden)
+        self.rebuild()
         _LOG.info("Hidden: %d categories, %d channel lists", len(hidden["categories"]), len(hidden["channels"]))
 
     # ------------------------------------------------------------- configuration
@@ -142,7 +207,9 @@ class Driver:
         self.account = int(cfg.get("account") or 1)
         self.raw_catalog = self.load_json("catalog.json") or {}
         self.hidden = self.load_json("hidden.json") or {}
-        self.catalog = Catalog(self.raw_catalog, self.hidden)
+        self.rebuild()
+        if self.epg_task is None or self.epg_task.done():
+            self.epg_task = asyncio.get_event_loop().create_task(self.guide_loop())
         if self.settings_server is None:
             port = int(os.getenv("TITAN_SETTINGS_PORT", "9097"))
             try:
@@ -249,6 +316,21 @@ class Driver:
                 attrs[mp.Attributes.MEDIA_ARTIST] = cat["name"]
                 attrs[mp.Attributes.MEDIA_IMAGE_URL] = ch.get("logo") or attrs[mp.Attributes.MEDIA_IMAGE_URL]
                 attrs[mp.Attributes.STATE] = mp.States.PLAYING if state in ("ON", "PLAYING") else state
+                p = self.guide.now(ch["id"]) if self.guide else None
+                if p:  # "Plus belle la vie" / "TF1 FHD · 14:00–14:25" with the programme image and its progress
+                    attrs[mp.Attributes.MEDIA_TITLE] = p["title"]
+                    attrs[mp.Attributes.MEDIA_ARTIST] = f"{ch['name']} · {hhmm(p['start'])}–{hhmm(p['stop'])}"
+                    attrs[mp.Attributes.MEDIA_IMAGE_URL] = p.get("icon") or attrs[mp.Attributes.MEDIA_IMAGE_URL]
+                    attrs[mp.Attributes.MEDIA_DURATION] = p["stop"] - p["start"]
+                    key = (ch["id"], p["start"])
+                    if key != self.programme_key or mp.Attributes.MEDIA_POSITION not in self.last:
+                        attrs[mp.Attributes.MEDIA_POSITION] = int(time.time() - p["start"])
+                        attrs[mp.Attributes.MEDIA_POSITION_UPDATED_AT] = datetime.now(timezone.utc).isoformat()
+                        self.programme_key = key
+                else:
+                    attrs[mp.Attributes.MEDIA_DURATION] = 0
+                    attrs[mp.Attributes.MEDIA_POSITION] = 0
+                    self.programme_key = None
         return attrs
 
     async def refresh(self) -> None:
