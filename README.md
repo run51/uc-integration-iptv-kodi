@@ -8,7 +8,8 @@ Shield). Runs on the Remote.
   login is kept in a private file of the integration, never in the catalog nor the logs), choose the
   categories and channels shown, "4K first" (a channel shown in 4K hides its other versions).
 - **Kodi feed** on the same port, only for Kodi's address: `/kodi.m3u` (channels shown, then their other
-  versions kept for the replay) and `/epg.xml.gz` (public French guide xmltvfr.fr reduced to these channels).
+  versions kept for the replay) and `/epg.xml.gz` (public French guide xmltvfr.fr, read by Kodi; the Remote asks Kodi for the programmes it
+  shows and only reads the guide's channel list to give each channel its guide id).
   Set them as the M3U and XMLTV addresses of PVR IPTV Simple Client, with catch-up enabled.
 - **Player**: a tap on a channel plays it; programme page per channel with "Déjà diffusé" (replay, through
   the FHD version of a 4K channel when the provider does not record 4K); the browser opened from the player

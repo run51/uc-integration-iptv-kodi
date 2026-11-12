@@ -70,13 +70,14 @@ def elements(source):
         stream.close()
 
 
-def parse(source, wanted: set[str], now: float | None = None, reduced: str | None = None
-          ) -> tuple[dict[str, str], dict[str, list[dict]]]:
+def parse(source, wanted: set[str], now: float | None = None, reduced: str | None = None,
+          channels_only: bool = False) -> tuple[dict[str, str], dict[str, list[dict]]]:
     """(guide channel id -> folded display names joined, guide id -> programmes) for the wanted ids.
 
     source: path of the XMLTV file (gzipped or not) or its bytes. wanted may be empty: then all channel names
     are returned and no programme (first pass for name matching). reduced: path of a gzipped XMLTV file to
-    write with only the wanted channels and their programmes (the guide served to Kodi).
+    write with only the wanted channels and their programmes (the guide served to Kodi). channels_only: stop
+    at the first programme (XMLTV lists the channels first): the names in a few seconds.
     """
     now = now or time.time()
     names: dict[str, str] = {}
@@ -92,6 +93,8 @@ def parse(source, wanted: set[str], now: float | None = None, reduced: str | Non
                 if out and cid in wanted:
                     out.write(ET.tostring(el, encoding="utf-8"))
                 continue
+            if channels_only:
+                break
             cid = el.get("channel", "")
             if cid not in wanted:
                 continue

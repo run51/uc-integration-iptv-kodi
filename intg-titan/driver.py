@@ -31,6 +31,8 @@ import ucapi
 from catalog import Catalog, day_label, hhmm, is_4k
 from kodi_client import DEFAULT_URL as KODI_URL
 from kodi_client import Kodi, KodiError, kodi_name, utc_ts
+from kodi_guide import KodiGuide
+from kodi_guide import programme as kodi_programme
 from ucapi import media_player as mp
 
 _LOG = logging.getLogger("titan")
@@ -173,13 +175,18 @@ class Driver:
         self.raw_catalog: dict = {}
         self.hidden: dict = {}
         self.settings_server = None
-        self.guide: epg.Guide | None = None
+        self.guide = KodiGuide()  # programmes asked to Kodi (it reads the public guide itself)
+        self.guide_ids: dict[int, str] = {}  # stream id -> guide channel id, for the tvg-id of Kodi's playlist
+        self.sid_by_kodi_name: dict[str, int] = {}
         self.epg_task: asyncio.Task | None = None
         self.programme_key = None  # (stream, start) of the programme whose position was last sent
 
     def rebuild(self) -> None:
         self.catalog = Catalog(self.raw_catalog, self.hidden, self.guide, self.no_replay)
         self.feed_cache = None
+        self.sid_by_kodi_name = {}
+        for _, ch in self.catalog.lineup:
+            self.sid_by_kodi_name.setdefault(kodi_name(ch["name"]), ch["id"])
         self.by_kodi_name = {}
         for cat in self.catalog.categories:
             for ch in cat["channels"]:
@@ -222,8 +229,9 @@ class Driver:
                 _LOG.warning("Guide download %s failed: %s", url, ex)
 
     async def load_guide(self, download: bool = True) -> None:
-        """Download the public guide (or use the copy kept), keep the programmes of the catalog channels and
-        write the reduced guide served to Kodi. Read as a stream: the Remote gives ~100 MB to an integration."""
+        """Download the public guide (or use the copy kept) and match the playlist channels to its channel ids,
+        from its channel list only: Kodi reads the programmes (the full file is served to it), the Remote asks
+        Kodi for what it shows."""
         if download:
             await asyncio.to_thread(self.download_guide)
         source = self.path("epg.xml.gz")
@@ -233,16 +241,54 @@ class Driver:
         channels = [ch for cat in self.raw_catalog.get("categories", []) for ch in cat["channels"]]
 
         def work():
-            names, _ = epg.parse(source, set())
-            ids = epg.match_ids(channels, names)
-            _, progs = epg.parse(source, set(ids.values()), reduced=self.path("kodi_epg.xml.gz"))
-            return epg.Guide(progs, ids)
+            names, _ = epg.parse(source, set(), channels_only=True)
+            return epg.match_ids(channels, names)
 
-        self.guide = await asyncio.to_thread(work)
+        self.guide_ids = await asyncio.to_thread(work)
         self.feed_cache = None
-        self.rebuild()
-        count = sum(len(v) for v in self.guide.progs.values())
-        _LOG.info("Guide: %d channels, %d programmes", len(self.guide.ids), count)
+        _LOG.info("Guide: %d of %d playlist channels matched", len(self.guide_ids), len(channels))
+
+    # --------------------------------------------------------- programmes from Kodi
+    async def refresh_nows(self, force: bool = False) -> None:
+        """Programme on air of every channel, in one request to Kodi (kept a minute)."""
+        if not (force or self.guide.nows_stale()) or not await self.kodi.alive():
+            return
+        res = await self.kodi.call("PVR.GetChannels", {"channelgroupid": "alltv", "properties": ["broadcastnow"]})
+        nows = {}
+        for c in (res or {}).get("channels") or []:
+            sid = self.sid_by_kodi_name.get(c.get("label") or "")
+            p = kodi_programme(c["broadcastnow"], utc_ts) if sid and c.get("broadcastnow") else None
+            if p:
+                nows[sid] = p
+        self.guide.set_nows(nows)
+
+    async def fetch_channel(self, stream_id: int) -> None:
+        """Programmes of a channel (yesterday to the coming days), asked when its page is opened."""
+        if not self.guide.channel_stale(stream_id) or not await self.kodi.alive():
+            return
+        cid = await self.kodi_channel(stream_id)
+        if cid is None:
+            return
+        res = await self.kodi.call("PVR.GetBroadcasts", {
+            "channelid": cid, "properties": ["title", "starttime", "endtime", "genre", "episodename", "thumbnail"]})
+        progs = [p for p in (kodi_programme(b, utc_ts) for b in (res or {}).get("broadcasts") or []) if p]
+        self.guide.set_channel(stream_id, progs)
+
+    async def prepare(self, media_id: str | None) -> None:
+        """Ask Kodi for the programmes the page about to be shown needs (nothing when Kodi is not running)."""
+        try:
+            await self.refresh_nows()
+            target = None
+            if not media_id:
+                playing = self.last.get(mp.Attributes.STATE) in (mp.States.PLAYING, mp.States.PAUSED)
+                target = self.current[1] if playing and self.current else None
+            else:
+                parsed = Catalog.parse_channel_id(media_id) or Catalog.parse_channel_id(media_id, "past")
+                target = parsed[1] if parsed else None
+            if target:
+                await self.fetch_channel(target)
+        except KodiError as ex:
+            _LOG.debug("Programmes not available from Kodi: %s", ex)
 
     async def guide_loop(self) -> None:
         await self.load_guide(download=False)  # cached copy first: browsing has the guide at once
@@ -291,17 +337,16 @@ class Driver:
 
     def feed_file(self, path: str) -> tuple[bytes, str] | None:
         """Kodi's playlist (built from the channels shown + their versions kept for the replay) or guide."""
-        if path == "/epg.xml.gz":
+        if path == "/epg.xml.gz":  # the whole public guide: Kodi reads the programmes itself
             try:
-                with open(self.path("kodi_epg.xml.gz"), "rb") as file:
+                with open(self.path("epg.xml.gz"), "rb") as file:
                     return file.read(), "application/gzip"
             except OSError:
                 return None
         if not self.stream_base or not self.catalog.lineup:
             return None
         if self.feed_cache is None:
-            ids = self.guide.ids if self.guide else {}
-            self.feed_cache = feed.build_m3u(self.catalog.lineup, ids, self.stream_base).encode()
+            self.feed_cache = feed.build_m3u(self.catalog.lineup, self.guide_ids, self.stream_base).encode()
         return self.feed_cache, "audio/x-mpegurl; charset=utf-8"
 
     def save_hidden(self, hidden: dict) -> None:
@@ -376,6 +421,7 @@ class Driver:
 
     # -------------------------------------------------------------- browsing
     async def browse(self, options: mp.BrowseOptions):
+        await self.prepare(options.media_id)
         playing = self.last.get(mp.Attributes.STATE) in (mp.States.PLAYING, mp.States.PAUSED)
         try:
             container, items = self.catalog.browse(options.media_id, self.current if playing else None)
@@ -386,6 +432,7 @@ class Driver:
         return mp.BrowseResults(media=container, pagination=ucapi.Pagination(page=page, limit=limit, count=len(items)))
 
     async def search(self, options: mp.SearchOptions):
+        await self.prepare("root")
         items = self.catalog.search(options.query)
         page, limit = page_bounds(options.paging)
         return mp.SearchResults(media=items[(page - 1) * limit : page * limit],
@@ -684,10 +731,16 @@ class Driver:
         attrs[mp.Attributes.MEDIA_IMAGE_URL] = ch.get("logo") or ""
         began = item_ts(item.get("starttime"))
         now = time.time()
-        live = self.guide.now(ch["id"]) if self.guide else None
+        if item.get("type") == "channel" and began is not None:  # live: the programme on air, as Kodi sees it
+            live = {"title": item.get("title") or "", "start": int(began),
+                    "stop": int(item_ts(item.get("endtime")) or began), "icon": item.get("thumbnail") or ""}
+            if not str(live["icon"]).startswith("http"):
+                live["icon"] = ""
+        else:
+            live = self.guide.now(ch["id"])
         # a programme opened from the guide (not the channel) that began before the one on air: replay
         if item.get("type") != "channel" and began is not None and (not live or began < live["start"] - 60):
-            progs = self.guide.programmes(ch["id"]) if self.guide else []
+            progs = self.guide.programmes(ch["id"])
             p = next((x for x in progs if abs(x["start"] - began) < 120), None)
             p = p or {"title": item.get("title") or "", "start": began, "stop": item_ts(item.get("endtime")) or began}
             when = f"{day_label(p['start'], now)}{hhmm(p['start'])}–{hhmm(p['stop'])}"
@@ -712,6 +765,11 @@ class Driver:
         except KodiError as ex:
             _LOG.debug("Kodi state unavailable: %s", ex)
             pl = False
+        if pl and pl["item"].get("type") != "channel":  # replay or not: compare with the programme on air
+            try:
+                await self.refresh_nows()
+            except KodiError:
+                pass
         if pl or (pl is None and str(a.get("source") or "") in ("Kodi", "Google Play Store")):
             return self.kodi_attrs(pl)
         return {mp.Attributes.STATE: state, mp.Attributes.MEDIA_TYPE: "channel",  # another app is on screen
