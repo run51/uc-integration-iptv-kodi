@@ -1,6 +1,8 @@
 # Builds the Remote installation archive (aarch64, Python runtime packed by PyInstaller) when a version tag
-# is pushed. Private repository: the archive is committed to the "build" branch, fetched there with git.
-name: "Build"
+# is pushed, and attaches it to a GitHub release (download from the web page).
+# Private repository: the archive is also committed to the "build" branch, because a deploy key can fetch
+# it there with git but cannot download release assets.
+name: "Build & Release"
 
 "on":
   push:
@@ -57,6 +59,23 @@ jobs:
           tar czf "/tmp/$NAME.tar.gz" -C artifacts .
           (cd /tmp && sha256sum "$NAME.tar.gz" > "$NAME.sha256")
           ls -lah /tmp/$NAME.*
+
+      - name: Create release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "/tmp/${{ env.NAME }}.tar.gz,/tmp/${{ env.NAME }}.sha256"
+          tag: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+          body: |
+            Archive to install on the Unfolded Circle Remote: `${{ env.NAME }}.tar.gz`
+            (web configurator, Integrations, Add new, Install custom).
+          draft: false
+          # Test builds (version containing "test") are pre-releases, never shown as the latest version.
+          prerelease: ${{ contains(env.VERSION, 'test') }}
+          makeLatest: ${{ contains(env.VERSION, 'test') && 'false' || 'true' }}
+          allowUpdates: true
+          replacesArtifacts: true
+          artifactErrorsFailBuild: true
 
       - name: Publish to the build branch
         shell: bash
