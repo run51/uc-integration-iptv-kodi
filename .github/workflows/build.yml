@@ -1,7 +1,7 @@
 # Builds the Remote installation archive (aarch64, Python runtime packed by PyInstaller) when a version tag
 # is pushed, and attaches it to a GitHub release (download from the web page).
-# Private repository: the archive is also committed to the "build" branch, because a deploy key can fetch
-# it there with git but cannot download release assets.
+# The archive is also committed to the "build" branch, to be fetched with git alone.
+# The driver id stays "titan_player" (first version of this integration): the Remote refers to the entity by it.
 name: "Build & Release"
 
 "on":
@@ -45,7 +45,7 @@ jobs:
             bash -c "cd /workspace && \
               python -m pip install -r requirements.txt && \
               pyinstaller --clean --onedir --collect-all tzdata --collect-data certifi \
-                --name intg-${DRIVER_ID} intg-titan/driver.py"
+                --name intg-${DRIVER_ID} intg-iptv/driver.py"
 
       - name: Package
         shell: bash
@@ -54,7 +54,7 @@ jobs:
           mv dist/intg-${DRIVER_ID}/* artifacts/bin
           mv artifacts/bin/intg-${DRIVER_ID} artifacts/bin/driver
           jq --arg v "$VERSION" '.version = $v' driver.json > artifacts/driver.json
-          NAME="uc-intg-${DRIVER_ID}-${VERSION}-aarch64"
+          NAME="uc-intg-iptv-kodi-${VERSION}-aarch64"
           echo "NAME=$NAME" >> "$GITHUB_ENV"
           tar czf "/tmp/$NAME.tar.gz" -C artifacts .
           (cd /tmp && sha256sum "$NAME.tar.gz" > "$NAME.sha256")

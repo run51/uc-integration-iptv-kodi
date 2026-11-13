@@ -76,7 +76,7 @@ class Feed:
         if not fresh:
             for url in epg.SOURCES:
                 try:
-                    req = urllib.request.Request(url, headers={"User-Agent": "uc-intg-titan-player kodi-feed"})
+                    req = urllib.request.Request(url, headers={"User-Agent": "uc-intg-iptv-kodi kodi-feed"})
                     with urllib.request.urlopen(req, timeout=120) as resp:
                         data = resp.read()
                     with open(cache, "wb") as file:
